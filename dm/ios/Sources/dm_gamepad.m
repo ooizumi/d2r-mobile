@@ -21,9 +21,13 @@
 // 多个手柄：每个手柄各存各的键和摇杆，交给游戏的是合起来的——键取或、每根摇杆取推得最远的那个。断开一个只拿掉它那一份，别的手柄按着的键不丢。
 // 失活 / 进后台 / 来电（前端 front_ios_focus_event → dm_gamepad_reset）：所有手柄的键和摇杆清零。回调只在值变化时来，按着键切走、在后台松开，回来不会补一次「松开」。
 #import <GameController/GameController.h>
+#include <TargetConditionals.h>
 #include "dm_input.h"
 #include "dm_padmap.h"
 #include "hle.h"
+#if TARGET_OS_OSX
+#include "dm_gamepad_hid_mac.h"
+#endif
 
 static void (*g_on_mode)(int pad);
 static int g_pad_mode, g_need_center;
@@ -80,6 +84,9 @@ static void drop(const void *who) {   // 这个手柄没了：只拿掉它那一
 }
 void dm_gamepad_touched(void) { if (g_pad_mode) { g_need_center = 1; set_mode(0); apply(); } }   // 前端：碰了屏幕。摇杆此刻偏着的话要先回中才重新接管 | Front end: the screen was touched. If a stick is deflected right now it must return to center before taking over again
 void dm_gamepad_reset(void) {   // 前端：失活 / 进后台 / 来电 | Front end: resign active / enter background / incoming call
+#if TARGET_OS_OSX
+    dm_gamepad_hid_mac_focus(0);
+#endif
     int any = 0; for (int i = 0; i < NSLOT; i++) if (g_s[i].who) { any |= g_s[i].b != 0 || g_s[i].ax[0] || g_s[i].ax[1] || g_s[i].ax[2] || g_s[i].ax[3]; g_s[i].b = 0; memset(g_s[i].ax, 0, sizeof g_s[i].ax); }
     if (any) { LOG("手柄：失活，手柄的键和摇杆清零"); apply(); }
 }
@@ -93,6 +100,9 @@ static int is_xbox(GCController *c) { return [c.extendedGamepad isKindOfClass:[G
 static int is_ps(GCController *c) { NSString *k = c.productCategory; return [k isEqualToString:GCProductCategoryDualSense] || [k isEqualToString:GCProductCategoryDualShock4]; }
 static int glyph_of(GCController *c) { return is_xbox(c) ? DM_GLYPH_XBOX : is_ps(c) ? DM_GLYPH_PS : DM_GLYPH_PAD; }   // 这只手柄用哪套键帽
 static void publish(GCController *c, GCExtendedGamepad *g) {
+#if TARGET_OS_OSX
+    if (dm_gamepad_hid_mac_claims_vendor(c.vendorName.UTF8String)) return;
+#endif
     uint64_t b = 0; int xb = is_xbox(c);
     if (xb) b |= dm_padmap_face_xbox(g.buttonA.pressed, g.buttonB.pressed, g.buttonX.pressed, g.buttonY.pressed, 0);   // Xbox 手柄：按物理位置（dm_padmap.h） | Xbox controller: by physical position (dm_padmap.h)
     else b |= dm_padmap_face(g.buttonA.pressed, g.buttonB.pressed, g.buttonX.pressed, g.buttonY.pressed);   // 其余：系统给哪个字母发哪个字母（dm_padmap.h） | Others: send whichever letter the system reports (dm_padmap.h)
@@ -104,12 +114,33 @@ static void publish(GCController *c, GCExtendedGamepad *g) {
 }
 static void attach(GCController *c) {
     GCExtendedGamepad *g = c.extendedGamepad; if (!g) { LOG("手柄：%s 不是扩展手柄，不接", c.vendorName.UTF8String ?: "?"); return; }
+#if TARGET_OS_OSX
+    if (dm_gamepad_hid_mac_claims_vendor(c.vendorName.UTF8String)) {
+        g.valueChangedHandler = nil; drop((__bridge const void *)c);
+        LOG("手柄：%s 由原始 HID 接管",c.vendorName.UTF8String ?: "?");
+        return;
+    }
+#endif
     LOG("手柄：连上 %s，类别 %s → %s", c.vendorName.UTF8String ?: "?", c.productCategory.UTF8String ?: "?", is_xbox(c) ? "Xbox 手柄：面键按位置排（下 A 右 B 上 X 左 Y）、Xbox 键帽" : is_ps(c) ? "面键 buttonA/B/X/Y 直接发 A/B/X/Y、PlayStation 键帽" : "面键 buttonA/B/X/Y 直接发 A/B/X/Y");
     __weak GCController *wc = c;
     g.valueChangedHandler = ^(GCExtendedGamepad *gp, GCControllerElement *el) { (void)el; GCController *sc = wc; if (sc) publish(sc, gp); };
 }
+#if TARGET_OS_OSX
+static void hid_ownership_changed(void) {
+    for (GCController *c in GCController.controllers)
+        if (c.vendorName && [c.vendorName caseInsensitiveCompare:@"GameSir-X4A for Xbox"] == NSOrderedSame) attach(c);
+}
+void dm_gamepad_resume(void) {
+    dm_gamepad_hid_mac_focus(1);
+    for (GCController *c in GCController.controllers)
+        if (c.extendedGamepad) publish(c,c.extendedGamepad);
+}
+#endif
 void dm_gamepad_start(void (*on_mode)(int pad)) {
     g_on_mode = on_mode;
+#if TARGET_OS_OSX
+    dm_gamepad_hid_mac_start(put,drop,hid_ownership_changed);
+#endif
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
     [nc addObserverForName:GCControllerDidConnectNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) { attach(n.object); }];
     [nc addObserverForName:GCControllerDidDisconnectNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
