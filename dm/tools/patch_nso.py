@@ -196,7 +196,11 @@ if RULE_RUN:
     # Directional light shadow map edge length (quality level 1, 0x168a520 fills +0x48 → creates the 2-layer array 0x1697394): 2100 → 1024. Authorization: "visually indistinguishable is enough";
     # on the second Mac, 108 images + 16 consecutive frames: for camp / wilderness / combat, at every level down to 1024 the FLIP cannot be told apart from the noise of a rerun with the same settings, and the change between adjacent frames in shadow regions is 0.71 → 0.75; on a real device the two shadow maps total about 0.7–1.4 ms / frame.
     # The shadow size constants and the viewport that the game passes to the shader change with the same config value (verified by dump). The native rule domain (the Mac gate check against the original game's ground truth) stays at 2100
-    SHADOW_SIDE = 1024
+    # Android quality experiments use the same game-owned size for allocation,
+    # viewport and shader constants. Keep other targets and the default at 1024.
+    SHADOW_SIDE = int(os.environ.get('DM_ANDROID_SHADOW_SIDE', '1024')) if os.environ.get('DM_TARGET') == 'android' else 1024
+    if SHADOW_SIDE not in (768, 1024):
+        raise ValueError('DM_ANDROID_SHADOW_SIDE must be 768 or 1024')
     movz_w14 = lambda n: struct.pack('<I', 0x52800000 | (n << 5) | 14).hex()   # movz w14,#n——字节由表达式算，不手写（手算成 #32768，阴影图 32768² 分配失败启动即崩） | movz w14,#n -- the bytes are computed by an expression, not written by hand (a hand calculation came out as #32768, and the shadow map allocation of 32768² failed, crashing at startup)
     cuts.append((0x168a580, movz_w14(2100), movz_w14(SHADOW_SIDE), f'阴影图边长 mov w14,#2100 → mov w14,#{SHADOW_SIDE}（档位 1）', '仅宿主'))
 if RULE_RUN:

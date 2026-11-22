@@ -10,7 +10,16 @@ import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { display } from '@kit.ArkUI';
 import { IosOverlay } from '../components/IosOverlay';
+import { GameDebugMenu } from '../components/GameDebugMenu';
+import { applyDebugSettings, loadDebugSettings } from '../utils/DebugSettings';
 import { UI_TEXT_EN, UI_TEXT_ZH } from '../generated/UiText';
+import { InstallerImportResult, runFreshInstallerImport } from '../utils/InstallerImport';
+import {
+  CloudSaveConflict,
+  CloudSaveManager,
+  CloudSaveStartupResult,
+  getCloudSaveManager
+} from '../utils/CloudSave';
 
 interface InputRequest { id: number; title: string; sub: string; guide: string; initial: string; maxChars: number; nameRule: number; numericMax: number }
 
@@ -22,11 +31,20 @@ struct Index {
   @State request: InputRequest | null = null;
   @State text: string = '';
   @State fps: string = '';
+  @State debugMenuOpen: boolean = false;
   @State canImport: boolean = false;
   @State importing: string = '';
+  @State cloudPhase: string = 'checking';
+  @State cloudMessage: string = '正在检查云存档…';
+  @State cloudEndpoint: string = '';
+  @State cloudToken: string = '';
+  @State cloudConflict: CloudSaveConflict | null = null;
+  @State cloudBusy: boolean = false;
   private fpsTimer: number = -1;
   private lastPresents: number = 0;
   private lastFpsAt: number = 0;
+  private cloudManager: CloudSaveManager | null = null;
+  private booting: boolean = false;
   @StorageProp('safeLeftPx') safeLeftPx: number = 0;
   @StorageProp('safeRightPx') safeRightPx: number = 0;
   @StorageProp('safeBottomPx') safeBottomPx: number = 0;
@@ -35,11 +53,16 @@ struct Index {
 
   private t(key: string): string { return (this.lang.startsWith('zh') ? UI_TEXT_ZH : UI_TEXT_EN)[key] ?? key; }
   private dataDir(): string {
+    const imported = this.files + '/romfs/data';
+    try { if (fileIo.accessSync(imported + '/.build.config') || fileIo.accessSync(imported + '/build.config')) { return imported; } } catch (e) { }
     const base = this.files + '/game-data';
     try { if (fileIo.accessSync(base + '/data/.build.config') || fileIo.accessSync(base + '/data/build.config')) { return base + '/data'; } } catch (e) { }
     return base;
   }
   private boot(): void {
+    if (this.booting) { return; }
+    this.booting = true;
+    applyDebugSettings(loadDebugSettings(this.files));
     dm.setCallbacks(
       (id: number, title: string, sub: string, guide: string, initial: string, maxChars: number, nameRule: number, numericMax: number) => {
         this.text = initial; this.request = { id, title, sub, guide, initial, maxChars, nameRule, numericMax };
@@ -49,7 +72,7 @@ struct Index {
     const rc = dm.start(this.files, this.files, this.dataDir(), this.lang.startsWith('zh') ? 'zh-Hans' : 'en-US');
     if (rc > 0) {
       this.started = true;
-      // 调试帧率（顶部居中，同老版）：每秒取出图帧数差 | Debug FPS (top center, as the old build): presented-frame difference per second
+      // 调试帧率：每秒取出图帧数差 | Debug FPS: presented-frame difference per second
       this.lastPresents = dm.presentCount(); this.lastFpsAt = Date.now();
       this.fpsTimer = setInterval(() => {
         const n = dm.presentCount(), t = Date.now();
@@ -57,12 +80,108 @@ struct Index {
         this.lastPresents = n; this.lastFpsAt = t;
       }, 1000);
     } else {
+      this.booting = false;
       // -2 没有游戏数据，-3 没有执行映像，-4 没有着色器，-5 缺 build.config，-9/-10 overlay 缺或不符，-11 导入包与应用不配套，-12 衍生表没读全：都可以用「导入游戏资源」补齐
       // -2 no game data, -3 no execution images, -4 no shaders, -5 missing build.config, -9/-10 overlay missing or mismatched, -11 import pack does not match the app, -12 derived tables incomplete: all fixed by importing resources
       this.canImport = [-2, -3, -4, -5, -9, -10, -11, -12].indexOf(rc) >= 0;
       this.error = `${(this.t('dmAndroidStartFailed') || '启动失败（%d）').replace('%d', String(rc))}${!this.canImport ? '' : (rc === -10 || rc === -11) ? (this.lang.startsWith('zh') ? '\n导入包与这版应用不配套：请用与这版应用同一版本的工具重新生成 dm 文件夹，再点下面的按钮导入' : '\nThe import pack does not match this version of the app: regenerate the dm folder with the tools of the same version, then import it with the button below') : rc === -12 ? (this.lang.startsWith('zh') ? '\n导入包缺少 derived.tsv 或内容不全：请用这版工具重新生成 dm 文件夹，再点下面的按钮导入' : '\nThe import pack lacks a complete derived.tsv: regenerate the dm folder with this version of the tools, then import it with the button below') : [-2, -5].indexOf(rc) >= 0 ? '\n缺少游戏数据：请把游戏的 data 文件夹放进手机上一个文件夹（例如「D2R Mobile」）里，再点下面的按钮选中那个文件夹' : '\n缺少运行组件：这个版本没有内置组件，请把 dm 文件夹（out、shaders、overlay、ui-art）和 data 放进同一个文件夹，再点下面的按钮选中它'}
 可执行内存自检 / exec self-test: ${dm.execProbe()}`;
     }
+  }
+  private getCloudManager(): CloudSaveManager {
+    if (this.cloudManager === null) {
+      this.cloudManager = getCloudSaveManager(this.files, getContext(this) as common.UIAbilityContext);
+    }
+    return this.cloudManager;
+  }
+  private applyCloudResult(result: CloudSaveStartupResult): void {
+    this.cloudMessage = result.message;
+    this.cloudEndpoint = result.endpoint;
+    this.cloudConflict = result.conflict;
+    if (result.kind === 'ready') {
+      this.cloudPhase = 'ready';
+      this.error = '';
+      this.importing = '';
+      this.boot();
+      return;
+    }
+    if (result.kind === 'setup') {
+      this.cloudPhase = 'setup';
+      this.cloudToken = '';
+      this.importing = '';
+      return;
+    }
+    if (result.kind === 'conflict') {
+      this.cloudPhase = 'conflict';
+      this.importing = '';
+      return;
+    }
+    this.cloudPhase = 'network';
+    this.importing = '';
+  }
+  private async startWithCloudSave(): Promise<void> {
+    this.cloudPhase = 'checking';
+    this.cloudMessage = '正在核对本地、云端和上次同步状态…';
+    this.cloudBusy = true;
+    this.importing = '';
+    try {
+      this.applyCloudResult(await this.getCloudManager().initializeForStartup());
+    } catch (e) {
+      this.cloudPhase = 'network';
+      this.cloudMessage = `云存档检查失败：${JSON.stringify(e)}`;
+    } finally {
+      this.cloudBusy = false;
+    }
+  }
+  private async saveCloudConfig(): Promise<void> {
+    if (this.cloudBusy) { return; }
+    this.cloudBusy = true;
+    this.cloudPhase = 'checking';
+    this.cloudMessage = '正在保存云存档设置并连接…';
+    try {
+      this.applyCloudResult(await this.getCloudManager().saveConfig(this.cloudEndpoint, this.cloudToken));
+      if (this.cloudPhase !== 'setup') { this.cloudToken = ''; }
+    } catch (e) {
+      this.cloudPhase = 'setup';
+      this.cloudMessage = `保存云存档设置失败：${JSON.stringify(e)}`;
+    } finally {
+      this.cloudBusy = false;
+    }
+  }
+  private async resolveCloudConflict(choice: string): Promise<void> {
+    if (this.cloudBusy) { return; }
+    this.cloudBusy = true;
+    this.cloudPhase = 'checking';
+    this.cloudMessage = choice === 'cloud' ? '正在下载云端存档并保留本地恢复版本…' : '正在上传本地存档并校验云端提交…';
+    try {
+      this.applyCloudResult(await this.getCloudManager().resolveConflict(choice));
+    } catch (e) {
+      this.cloudPhase = 'network';
+      this.cloudMessage = `处理云存档冲突失败：${JSON.stringify(e)}`;
+    } finally {
+      this.cloudBusy = false;
+    }
+  }
+  private startCloudOffline(): void {
+    this.getCloudManager().startOffline();
+    this.cloudPhase = 'ready';
+    this.cloudConflict = null;
+    this.cloudToken = '';
+    this.boot();
+  }
+  private editCloudConfig(): void {
+    this.cloudPhase = 'setup';
+    this.cloudMessage = '请检查云存档地址和配对码后重新连接。';
+    this.cloudToken = '';
+    this.cloudConflict = null;
+  }
+  private cloudBytes(value: number): string {
+    return value >= 1048576 ? `${(value / 1048576).toFixed(1)} MB` : `${Math.ceil(value / 1024)} KB`;
+  }
+  private conflictSummary(): string {
+    const c = this.cloudConflict;
+    if (c === null) { return ''; }
+    return `本地：${c.localFiles} 个文件，${this.cloudBytes(c.localBytes)}\n云端：${c.remoteFiles} 个文件，${this.cloudBytes(c.remoteBytes)}，更新于 ${c.remoteUpdatedAt || '未知时间'}\n两个版本在上次同步后都有变化。覆盖前会保留可恢复版本；备份不会被自动删除。`;
   }
   // 调试版内置运行包（out / shaders / overlay / ui-art 压成 dm-pack.zip，见 entry/build-profile.json5 的 default 目标和 scripts/stage_debug_pack.sh）：
   // 首次启动或包版本变了，解压到 files/dm（游戏照常从那里读），玩家只需导入游戏的 data。发布版没有内置包，直接跳过
@@ -152,20 +271,115 @@ struct Index {
     dm.textResult(this.request.id, accepted, accepted ? this.text : ''); this.request = null;
   }
 
+  private showDebugMenu(): void {
+    if (!this.started || this.request !== null) { return; }
+    dm.releaseTouches();
+    this.debugMenuOpen = true;
+    hilog.info(0, 'dm', 'debug HUD opened by FPS long press');
+  }
+  private closeDebugMenu(): void {
+    dm.releaseTouches();
+    this.debugMenuOpen = false;
+  }
+  onBackPress(): boolean {
+    if (this.request !== null) { this.finishInput(false); return true; }
+    if (this.debugMenuOpen) { this.closeDebugMenu(); return true; }
+    if (this.started) {
+      dm.gameBack();
+      hilog.info(0, 'dm', 'system back forwarded to game');
+      return true;
+    }
+    return false;
+  }
+  onPageHide(): void { this.closeDebugMenu(); }
+  aboutToDisappear(): void {
+    if (this.fpsTimer >= 0) { clearInterval(this.fpsTimer); this.fpsTimer = -1; }
+    dm.releaseTouches();
+  }
+
   build() {
     Stack() {
       XComponent({ id: 'dm', type: XComponentType.SURFACE, libraryname: 'dm' })
         .width('100%').height('100%')
-        .onLoad(() => { this.preparePack().then(() => this.boot()); })
+        .onLoad(() => {
+          runFreshInstallerImport(getContext(this) as common.UIAbilityContext,
+            (message: string) => { this.importing = message; })
+            .then((result: InstallerImportResult) => {
+              if (result.outcome === 'failed') {
+                this.importing = '';
+                this.error = result.error;
+                this.canImport = false;
+                return;
+              }
+              this.importing = '';
+              this.preparePack().then(() => this.startWithCloudSave());
+            })
+            .catch((e: Error) => {
+              this.importing = '';
+              this.error = `安装失败：${e.message}`;
+              this.canImport = false;
+            });
+        })
       IosOverlay({
-        inputEnabled: this.started && this.request === null,
+        inputEnabled: this.started && this.request === null && !this.debugMenuOpen,
         overlayRoot: this.files + '/dm/overlay',
         artRoot: this.files + '/dm/ui-art',
         safeLeft: px2vp(this.safeLeftPx), safeRight: px2vp(this.safeRightPx), safeBottom: px2vp(this.safeBottomPx)
       }).width('100%').height('100%')
-      if (this.fps) {
-        Text(this.fps).fontColor('#ff66dd66').fontSize(14).backgroundColor('#66000000').padding({ left: 8, right: 8, top: 2, bottom: 2 })
-          .borderRadius(6).position({ x: '50%', y: 6 }).translate({ x: '-50%' }).hitTestBehavior(HitTestMode.Transparent)
+      if (this.cloudPhase !== 'ready' && !this.error) {
+        Column({ space: 14 }) {
+          Text('暗黑2 · 云存档').fontColor('#ffffd98c').fontSize(22).fontWeight(FontWeight.Bold)
+          Text(this.cloudMessage).fontColor('#ffe5dfcf').fontSize(15).textAlign(TextAlign.Center)
+          if (this.cloudPhase === 'checking') {
+            LoadingProgress().width(42).height(42).color('#ffffd98c')
+          }
+          if (this.cloudPhase === 'setup') {
+            Text('输入云存档配对码。配对码只保存在本机应用内。')
+              .fontColor('#ffbfb6a2').fontSize(13).textAlign(TextAlign.Center)
+            TextInput({ text: this.cloudEndpoint, placeholder: 'HTTPS 服务地址' })
+              .width('100%').onChange((v: string) => { this.cloudEndpoint = v; })
+            TextInput({ text: this.cloudToken, placeholder: '云存档配对码（密码）' })
+              .type(InputType.Password).width('100%').onChange((v: string) => { this.cloudToken = v; })
+            Row({ space: 14 }) {
+              Button('保存并连接').enabled(!this.cloudBusy).onClick(() => { this.saveCloudConfig(); })
+              Button('离线启动').enabled(!this.cloudBusy).onClick(() => { this.startCloudOffline(); })
+            }
+          }
+          if (this.cloudPhase === 'network') {
+            Text('网络失败时不会覆盖任何存档。可以重试、离线启动，或修改配对信息。').fontColor('#ffbfb6a2').fontSize(13)
+            Row({ space: 10 }) {
+              Button('重试').enabled(!this.cloudBusy).onClick(() => { this.startWithCloudSave(); })
+              Button('修改配对信息').enabled(!this.cloudBusy).onClick(() => { this.editCloudConfig(); })
+              Button('离线启动').enabled(!this.cloudBusy).onClick(() => { this.startCloudOffline(); })
+            }
+          }
+          if (this.cloudPhase === 'conflict') {
+            Text(this.conflictSummary()).fontColor('#ffe5dfcf').fontSize(14).textAlign(TextAlign.Start).width('100%')
+            Text('请选择保留方向。两个覆盖按钮都会先保留恢复版本。').fontColor('#ffffd98c').fontSize(13)
+            Column({ space: 10 }) {
+              Button('云存档覆盖本地').width('100%').enabled(!this.cloudBusy)
+                .onClick(() => { this.resolveCloudConflict('cloud'); })
+              Button('本地存档覆盖云端').width('100%').enabled(!this.cloudBusy)
+                .onClick(() => { this.resolveCloudConflict('local'); })
+              Button('暂不处理，离线启动').width('100%').enabled(!this.cloudBusy)
+                .onClick(() => { this.startCloudOffline(); })
+            }.width('100%')
+          }
+        }.width('72%').padding(26).backgroundColor('#f2141210').borderRadius(14)
+          .border({ width: 1, color: '#665f5140' })
+      }
+      if (this.fps && !this.debugMenuOpen) {
+        Text(this.fps).fontColor('#ff66dd66').fontSize(14).backgroundColor('#66000000')
+          .padding({ left: 10, right: 10, top: 10, bottom: 10 })
+          .constraintSize({ minWidth: 76, minHeight: 40 })
+          .borderRadius(6).position({ x: px2vp(this.safeLeftPx) + 8, y: 6 })
+          .id('d2r-fps').accessibilityText('FPS，长按打开调试菜单')
+          .hitTestBehavior(HitTestMode.Block)
+          .gesture(LongPressGesture({ repeat: false, duration: 600 }).onAction(() => { this.showDebugMenu(); }))
+      }
+      if (this.debugMenuOpen) {
+        GameDebugMenu({ filesRoot: this.files, fps: this.fps, onClose: () => { this.closeDebugMenu(); } })
+          .width('100%').height('100%')
       }
       if (this.error || this.importing) {
         Column({ space: 16 }) {

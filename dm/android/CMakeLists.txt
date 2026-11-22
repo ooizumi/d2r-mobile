@@ -100,7 +100,11 @@ target_include_directories(dmcore PUBLIC ${HOST} ${DM}/gfx/nvn/include ${CMAKE_C
 target_include_directories(dmcore PUBLIC ${DM}/ios/Sources)
 # 与 Makefile 同档优化（-O1 -g）；dm_android_compat.h 强制包含；-fno-strict-aliasing 同苹果 clang 缺省行为下宿主对客体内存的读写习惯
 # Same optimization level as the Makefile (-O1 -g); dm_android_compat.h force-included; -fno-strict-aliasing matches the host's habit of reading and writing guest memory under Apple clang's default behaviour
-set(DM_CFLAGS -O1 -g -Wall -Wno-unused-function -fno-strict-aliasing -include ${CMAKE_CURRENT_SOURCE_DIR}/compat/include/dm_android_compat.h)
+set(DM_HOST_OPT_LEVEL "1" CACHE STRING "Host C optimization level (1 or 2)")
+if(NOT DM_HOST_OPT_LEVEL MATCHES "^[12]$")
+  message(FATAL_ERROR "DM_HOST_OPT_LEVEL must be 1 or 2")
+endif()
+set(DM_CFLAGS -O${DM_HOST_OPT_LEVEL} -g -Wall -Wno-unused-function -fno-strict-aliasing -include ${CMAKE_CURRENT_SOURCE_DIR}/compat/include/dm_android_compat.h)
 target_compile_options(dmcore PUBLIC $<$<COMPILE_LANGUAGE:C>:${DM_CFLAGS} -std=gnu17>)
 target_link_libraries(dmcore PUBLIC dm_vulkan_engine aaudio android log m dl)
 

@@ -11,7 +11,12 @@
 #include "../../host/front.h"
 #include "../../host/hle.h"
 #include "../../host/dm_actions.h"
+#include "../../host/dm_input.h"
+#include "../../host/dm_scene_resolution.h"
 #include "../../android/vulkan_present.h"
+#include "../../gfx/vulkan/engine/xbg_game.h"
+#include "../../gfx/vulkan/engine/xbg_game_internal.h"
+#include "../../gfx/vulkan/engine/xbg_visual_options.h"
 #include "touch_ohos.h"
 #include "../../host/dm_i18n.h"
 #include "../../host/dm_custom.h"
@@ -39,14 +44,37 @@ static char g_files[1024], g_ext[1024], g_src[1024], g_runtime[1100];
 static FILE *g_logf;
 
 // ---- 生命周期：同安卓，UI 只入队，挂起在原生线程上做 | Lifecycle: as Android, the UI only enqueues ----
-static dm_lifecycle_dispatch g_lifecycle;
+static dm_lifecycle_dispatch g_lifecycle = DM_LIFECYCLE_DISPATCH_INIT;
 static pthread_once_t g_lifecycle_once = PTHREAD_ONCE_INIT;
 static int g_lifecycle_error;
+int dm_save_wait(double max_s, uint64_t *commits, int *froze, double *ms);
 static void lifecycle_graphics(int on) { dm_gfx_suspend(on); HLOG(LOG_INFO, "dm-lifecycle", "graphics suspend=%d", on); }
+static void lifecycle_background_save(int enabled) {
+    if (!enabled) {
+        HLOG(LOG_INFO, "dm-lifecycle", "background autosave skipped reason=disabled");
+        return;
+    }
+    if (!dm_ingame_now()) {
+        HLOG(LOG_INFO, "dm-lifecycle", "background autosave skipped reason=not_ingame");
+        return;
+    }
+    uint64_t commits = 0;
+    int froze = 0;
+    double duration_ms = 0;
+    dm_android_vk_set_background_save_discard(1);
+    int requested = dm_save_wait(2.5, &commits, &froze, &duration_ms);
+    dm_android_vk_set_background_save_discard(0);
+    int timeout = commits == 0;
+    HLOG(LOG_INFO, "dm-lifecycle",
+        "background autosave requested=%d commits=%llu froze=%d duration_ms=%.0f timeout=%d success=%d",
+        requested, (unsigned long long)commits, froze, duration_ms, timeout, commits != 0);
+}
 static void lifecycle_init(void) {
-    dm_lifecycle_ops ops = {dm_focus_set, dm_audio_suspend, lifecycle_graphics};
+    dm_lifecycle_ops ops = {dm_focus_set, dm_audio_suspend, lifecycle_graphics, lifecycle_background_save};
     g_lifecycle_error = dm_lifecycle_start(&g_lifecycle, ops);
-    if (!g_lifecycle_error) pthread_setname_np(g_lifecycle.thread, "dm-lifecycle");
+    if (!g_lifecycle_error) {
+        pthread_setname_np(g_lifecycle.thread, "dm-lifecycle");
+    } else HLOG(LOG_ERROR, "dm-lifecycle", "lifecycle worker start failed rc=%d", g_lifecycle_error);
 }
 static int lifecycle_ready(void) { pthread_once(&g_lifecycle_once, lifecycle_init); return !g_lifecycle_error; }
 
@@ -148,6 +176,24 @@ static int get_str(napi_env env, napi_value v, char *buf, size_t cap) { size_t n
 static napi_value ret_int(napi_env env, int v) { napi_value r; napi_create_int32(env, v, &r); return r; }
 static napi_value undefined(napi_env env) { napi_value r; napi_get_undefined(env, &r); return r; }
 #define ARGS(n) size_t argc = n; napi_value argv[n]; napi_get_cb_info(env, info, &argc, argv, NULL, NULL)
+
+int dm_fs_cloud_snapshot(const char *root, const char *target);
+int dm_fs_cloud_install(const char *root, const char *target);
+static _Atomic int g_cloud_started;
+static napi_value js_cloud_files(napi_env env, napi_callback_info info, int install) {
+    ARGS(2);
+    if (argc != 2) return ret_int(env, -EINVAL);
+    if (install && atomic_load(&g_cloud_started)) return ret_int(env, -EBUSY);
+    char root[4096], target[4096]; size_t rn = 0, tn = 0;
+    if (napi_get_value_string_utf8(env, argv[0], NULL, 0, &rn) != napi_ok ||
+        napi_get_value_string_utf8(env, argv[1], NULL, 0, &tn) != napi_ok ||
+        rn >= sizeof root || tn >= sizeof target ||
+        get_str(env, argv[0], root, sizeof root) < 0 || get_str(env, argv[1], target, sizeof target) < 0)
+        return ret_int(env, -EINVAL);
+    return ret_int(env, install ? dm_fs_cloud_install(root, target) : dm_fs_cloud_snapshot(root, target));
+}
+static napi_value js_cloud_snapshot(napi_env env, napi_callback_info info) { return js_cloud_files(env, info, 0); }
+static napi_value js_cloud_install(napi_env env, napi_callback_info info) { return js_cloud_files(env, info, 1); }
 
 static napi_value js_set_callbacks(napi_env env, napi_callback_info info) {
     ARGS(2); napi_value name;
@@ -304,7 +350,9 @@ static napi_value js_start(napi_env env, napi_callback_info info) {
     setenv("DM_ROMFS_OVERLAY", required, 1);
     if (!lifecycle_ready()) return ret_int(env, -8);
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8u << 20);
+    atomic_store(&g_cloud_started, 1);
     pthread_t th; int rc = pthread_create(&th, &a, host_thread, NULL); pthread_attr_destroy(&a);
+    if (rc) atomic_store(&g_cloud_started, 0);
     if (!rc) { started = 1; pthread_detach(th); }
     return ret_int(env, rc ? -1 : n);
 }
@@ -312,6 +360,9 @@ static napi_value js_start(napi_env env, napi_callback_info info) {
 // 0 失焦，1 后台，2 前台，3 激活（同安卓） | 0 unfocused, 1 background, 2 foreground, 3 active (as Android)
 static napi_value js_focus(napi_env env, napi_callback_info info) {
     ARGS(1); int32_t ev = 0; napi_get_value_int32(env, argv[0], &ev);
+    if (ev == 1) dm_android_vk_set_background(1);
+    else if (ev == 2 || ev == 3) dm_android_vk_set_background(0);
+    if (ev == 0 || ev == 1) xbg_game_request_pipeline_list_save();
     dm_ohos_touch_focus(ev == 2 || ev == 3);
     if (lifecycle_ready()) dm_lifecycle_post(&g_lifecycle, ev);
     return undefined(env);
@@ -328,6 +379,9 @@ static napi_value js_touch_screen(napi_env env, napi_callback_info info) {
     ARGS(5); double v[5] = {0};
     for (int i = 0; i < 5; i++) napi_get_value_double(env, argv[i], &v[i]);
     dm_ohos_touch_screen((float)v[0], (float)v[1], (float)v[2], (float)v[3], (float)v[4]); return undefined(env);
+}
+static napi_value js_release_touches(napi_env env, napi_callback_info info) {
+    (void)info; dm_ohos_touch_release(); return undefined(env);
 }
 // touchTick(Float32Array)：每帧调；写绘图快照，返回 1 = 要重画 | Called every frame; writes the drawing snapshot, returns 1 = redraw
 static napi_value js_touch_tick(napi_env env, napi_callback_info info) {
@@ -364,6 +418,60 @@ uint64_t mtl_present_count(void);
 static napi_value js_present_count(napi_env env, napi_callback_info info) {
     (void)info; napi_value r; napi_create_double(env, (double)mtl_present_count(), &r); return r;
 }
+
+// 调试面板读数：字段顺序必须与安卓 nativeReadDebugState 完全一致 | Debug readout: keep the exact field order of Android's nativeReadDebugState
+static napi_value js_read_debug_state(napi_env env, napi_callback_info info) {
+    (void)info;
+    double xbg_recent_gpu_ms(void);
+    dm_scene_resolution_state res; dm_scene_resolution_read(&res);
+    xbg_game_stats stats; xbg_game_get_stats(&stats);
+    xbg_frame_counters counters; xbg_game_frame_counters(&counters);
+    xbg_visual_state visual; xbg_game_get_visual_options(&visual);
+    const double values[14] = {res.requested_height, res.scene_width, res.scene_height,
+        res.output_width, res.output_height, xbg_recent_gpu_ms(),
+        (double)stats.presents, (double)counters.pipelines, counters.pipeline_ns / 1e6,
+        (double)stats.draws, visual.requested, visual.applied,
+        (double)visual.bloom_draws_skipped, (double)visual.pixel_upscale_draws};
+    napi_value result;
+    if (napi_create_array_with_length(env, 14, &result) != napi_ok) return undefined(env);
+    for (size_t i = 0; i < 14; i++) {
+        napi_value value;
+        if (napi_create_double(env, values[i], &value) != napi_ok ||
+            napi_set_element(env, result, (uint32_t)i, value) != napi_ok)
+            return undefined(env);
+    }
+    return result;
+}
+static napi_value js_set_scene_height(napi_env env, napi_callback_info info) {
+    ARGS(1); int32_t height = 0;
+    if (argc != 1 || napi_get_value_int32(env, argv[0], &height) != napi_ok) return ret_int(env, -EINVAL);
+    return ret_int(env, dm_scene_resolution_request(height));
+}
+static napi_value js_set_render_options(napi_env env, napi_callback_info info) {
+    ARGS(1); int32_t flags = 0;
+    if (argc != 1 || napi_get_value_int32(env, argv[0], &flags) != napi_ok) return ret_int(env, -EINVAL);
+    return ret_int(env, xbg_game_set_visual_options(flags));
+}
+static napi_value js_set_background_autosave(napi_env env, napi_callback_info info) {
+    ARGS(1); bool enabled = false;
+    if (argc != 1 || napi_get_value_bool(env, argv[0], &enabled) != napi_ok) return undefined(env);
+    dm_lifecycle_set_background_autosave(&g_lifecycle, enabled ? 1 : 0);
+    HLOG(LOG_INFO, "dm-lifecycle", "background autosave configured enabled=%d", enabled ? 1 : 0);
+    return undefined(env);
+}
+static napi_value js_request_profile(napi_env env, napi_callback_info info) {
+    ARGS(2); int32_t kind = 0, frames = 0;
+    if (argc != 2 || napi_get_value_int32(env, argv[0], &kind) != napi_ok ||
+        napi_get_value_int32(env, argv[1], &frames) != napi_ok)
+        return ret_int(env, -EINVAL);
+    return ret_int(env, dm_android_vk_request_profile(kind, frames));
+}
+// Return through the game's context-aware cancel/map action, never the host's default exit.
+static napi_value js_game_back(napi_env env, napi_callback_info info) {
+    (void)info;
+    dm_ohos_touch_back();
+    return undefined(env);
+}
 // ---- XComponent 窗口回调 → 呈现层（同安卓 nativeSurface） | XComponent window callbacks → presenter (as Android nativeSurface) ----
 static void surface_set(OH_NativeXComponent *c, void *window) {
     uint64_t w = 0, h = 0;
@@ -381,14 +489,23 @@ static OH_NativeXComponent_Callback g_xcb = {on_created, on_changed, on_destroye
 static napi_value init(napi_env env, napi_value exports) {
     napi_property_descriptor d[] = {
         {"start", NULL, js_start, NULL, NULL, NULL, napi_default, NULL},
+        {"cloudSnapshot", NULL, js_cloud_snapshot, NULL, NULL, NULL, napi_default, NULL},
+        {"cloudInstall", NULL, js_cloud_install, NULL, NULL, NULL, napi_default, NULL},
         {"focus", NULL, js_focus, NULL, NULL, NULL, napi_default, NULL},
         {"refresh", NULL, js_refresh, NULL, NULL, NULL, napi_default, NULL},
         {"touchEvent", NULL, js_touch_event, NULL, NULL, NULL, napi_default, NULL},
         {"touchScreen", NULL, js_touch_screen, NULL, NULL, NULL, napi_default, NULL},
+        {"releaseTouches", NULL, js_release_touches, NULL, NULL, NULL, napi_default, NULL},
         {"touchTick", NULL, js_touch_tick, NULL, NULL, NULL, napi_default, NULL},
         {"uiText", NULL, js_ui_text, NULL, NULL, NULL, napi_default, NULL},
         {"execProbe", NULL, js_exec_probe, NULL, NULL, NULL, napi_default, NULL},
         {"presentCount", NULL, js_present_count, NULL, NULL, NULL, napi_default, NULL},
+        {"readDebugState", NULL, js_read_debug_state, NULL, NULL, NULL, napi_default, NULL},
+        {"setSceneHeight", NULL, js_set_scene_height, NULL, NULL, NULL, napi_default, NULL},
+        {"setRenderOptions", NULL, js_set_render_options, NULL, NULL, NULL, napi_default, NULL},
+        {"setBackgroundAutosave", NULL, js_set_background_autosave, NULL, NULL, NULL, napi_default, NULL},
+        {"requestProfile", NULL, js_request_profile, NULL, NULL, NULL, napi_default, NULL},
+        {"gameBack", NULL, js_game_back, NULL, NULL, NULL, napi_default, NULL},
         {"setCallbacks", NULL, js_set_callbacks, NULL, NULL, NULL, napi_default, NULL},
         {"textResult", NULL, js_text_result, NULL, NULL, NULL, napi_default, NULL},
     };

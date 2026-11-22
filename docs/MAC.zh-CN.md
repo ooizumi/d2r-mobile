@@ -91,14 +91,24 @@ App 带本项目自己的图标（`dm/ios/Assets.xcassets/AppIcon.appiconset/App
 - 「按住…」类的按键提示点一下不够长，用键盘按住；一条提示带两个键帽的不认。
 - 血球、魔球、经验条点了没有反应。
 
-## 存档、日志与 iCloud
+## 存档、日志与云存档
 
 - 存档：`~/Library/Application Support/D2R Mobile/save`
 - 日志：`~/Library/Logs/D2R Mobile/host.log`（上一次运行的是 `host.prev.log`）。报问题时用菜单栏「帮助 → 分享日志…」：它把这两份日志和一份版本信息打成一个压缩包，让你选保存位置；不上传、不带存档，日志里的用户名会换成 `~`。
 - 没有声音时看日志：启动时有一行「audio：输出设备「…」，系统缺省输出「…」」，两者不一致会标红；退出时有一行「声卡回调累计 N」，N 为 0 表示这次没有出声。
 - 旧接口版（`D2R Mobile M3.app`）用的是名字里带 M3 的另一对目录。
 
-**iCloud 存档同步：自己构建的 App 缺省没有，有付费开发者账号可以打开。**程序里接了与 iPhone / iPad 相同的同步，但它需要 App 带着 iCloud 的签名权限。缺省用本机临时签名，没有这项权限，所以存档只留在这台 Mac 上，日志里会记一行「iCloud 不可用…只用本地存档」，游戏照常。有付费开发者账号时，下载一份带 iCloud 能力的 Mac 描述文件（`.provisionprofile`），放进 `~/dm-work/mac-sign`（或用 `DM_MAC_SIGN_DIR` 指到它所在的文件夹），用 `DM_MAC_ICLOUD=1 dm/tools/mac_app.sh` 构建：脚本从描述文件里读出团队、包标识和权限，用钥匙串里对应的证书签名。描述文件里的包标识决定用哪个 iCloud 容器，用你 iOS App 的包标识就能和 iPhone / iPad 同步。这项由 [@xielh96](https://github.com/xielh96) 贡献（[#121](https://github.com/jhaizhou-ops/d2r-mobile/pull/121)）。没有付费账号时，要把手机上的进度带过来，用下面的手工导入。
+### 与 Android / HarmonyOS 共用云存档
+
+Mac App 可连接同一套 HTTP 云存档服务，不需要 iCloud 权限或付费 Apple 开发者账号。将私人配对配置放在应用支持目录的 `cloud-save/config.json`，或用 `DM_HTTP_CLOUD_CONFIG` 指定文件路径。配置含令牌，须只对本人可读，不能提交到源码或公开安装包。协议与部署见 [CLOUD_SAVE_PROTOCOL.md](CLOUD_SAVE_PROTOCOL.md) 和 [CLOUD_SAVE.zh-CN.md](CLOUD_SAVE.zh-CN.md)。
+
+启动时对比本地、云端和上次同步状态；两边进度冲突时选择“云存档覆盖本地”“本地存档覆盖云端”或“暂时离线”。恢复前保留完整旧存档，`Settings` 等本机设置不参与同步。联网会话每 30 秒、切到后台及正常退出时尝试上传已经落盘的进度；游戏运行期间不下载覆盖本地。选择离线后，本次运行不会后台上传。
+
+配置 HTTP 云存档后，该会话不再启用下述 iCloud 同步，即使本次选择离线也不会切换同步服务。
+
+### iCloud
+
+**iCloud 存档同步：自己构建的 App 缺省没有，有付费开发者账号可以打开。**程序里接了与 iPhone / iPad 相同的同步，但它需要 App 带着 iCloud 的签名权限。缺省用本机临时签名，没有这项权限，所以存档只留在这台 Mac 上，日志里会记一行「iCloud 不可用…只用本地存档」，游戏照常。有付费开发者账号时，下载一份带 iCloud 能力的 Mac 描述文件（`.provisionprofile`），放进 `~/dm-work/mac-sign`（或用 `DM_MAC_SIGN_DIR` 指到它所在的文件夹），用 `DM_MAC_ICLOUD=1 dm/tools/mac_app.sh` 构建：脚本从描述文件里读出团队、包标识和权限，用钥匙串里对应的证书签名。描述文件里的包标识决定用哪个 iCloud 容器，用你 iOS App 的包标识就能和 iPhone / iPad 同步。这项由 [@xielh96](https://github.com/xielh96) 贡献（[#121](https://github.com/jhaizhou-ops/d2r-mobile/pull/121)）。也可用上述 HTTP 服务与 Android / HarmonyOS 同步，或用下面的方法手工导入。
 
 ### 从 iPhone / iPad 导入存档
 
@@ -143,5 +153,5 @@ App 带本项目自己的图标（`dm/ios/Assets.xcassets/AppIcon.appiconset/App
 - 「分享日志」的菜单项与保存面板未经真人操作，验过的是打出来的压缩包。
 - 「接上手柄提示换回手柄字母」是模拟验的，实体手柄没接过。
 - 手柄上 ZR 空格的免费回城没有。
-- 自己构建的 App 不做更新检查（它不联网）；iCloud 存档同步要用付费账号的描述文件、带 `DM_MAC_ICLOUD=1` 构建才有（见「存档、日志与 iCloud」）。
+- 自己构建的 App 默认不做更新检查。配置 HTTP 云存档后会连接指定服务；iCloud 同步另需付费账号的描述文件并带 `DM_MAC_ICLOUD=1` 构建（见「存档、日志与云存档」）。
 - 旧接口版在 macOS 15 上由一位内测玩家实际玩过（Mac mini M4，macOS 15.7，用的是出好的包）；在 macOS 15 的 Mac 上从本仓库自己构建，未经真人操作。

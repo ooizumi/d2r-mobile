@@ -163,7 +163,47 @@ static void test_scale3d(void) {
     printf("  （实玩第二段回放：慢帧均匀散开换级 %d 次，挤在一起换级 %d 次）\n", a, b);
     CHECK(a == 0 && b == 0, "动态比例：实玩第二段的慢帧序列（帧率 59+）不论散开还是挤在一起都不换级");
 }
+static void test_scene_resolution(void) {
+    dm_scene_resolution_state state;
+    CHECK(dm_scene_resolution_request(540) == 0, "局内分辨率：接受540p请求");
+    dm_scene_resolution_read(&state);
+    CHECK(state.requested_height == 540 && state.scene_height == 0 && state.output_height == 0,
+          "局内分辨率：请求不冒充已应用，也不在UI线程改渲染目标");
+    CHECK(dm_scene_resolution_request(359) == -1 && dm_scene_resolution_request(-1) == -1 &&
+          dm_scene_resolution_request(99999) == -1 && dm_scene_resolution_request(601) == -1,
+          "局内分辨率：拒绝越界及未定义档位");
+    dm_scene_resolution_read(&state);
+    CHECK(state.requested_height == 540, "局内分辨率：无效请求保留原选择");
+    const int heights[] = {360, 432, 480, 540, 600, 720, 900, 1080};
+    for (unsigned i = 0; i < sizeof heights / sizeof heights[0]; ++i) {
+        CHECK(dm_scene_resolution_request(heights[i]) == 0 &&
+              (int)(scene_height_scale(heights[i], 1080) * 1080 + 0.5f) == heights[i],
+              "局内分辨率：1080p UI下档位换算正确");
+    }
+    CHECK(scene_height_scale(1080, 720) == 1.0f && scene_height_scale(360, 2160) == (1.0f / 3.0f),
+          "局内分辨率：手动档比例限制在1/3至1.0范围");
+    // Publish what the renderer reports, not the selected height. The snapshot
+    // explicitly preserves independent UI dimensions during a pending change.
+    uint8_t *renderer = calloc(1, 0xef00);
+    *(uint32_t *)(renderer + 0xee78) = 1110;
+    *(uint32_t *)(renderer + 0xee7c) = 540;
+    *(uint32_t *)(renderer + 0xee88) = 2220;
+    *(uint32_t *)(renderer + 0xee8c) = 1080;
+    scene_dimensions_publish((uintptr_t)renderer);
+    dm_scene_resolution_request(720);
+    dm_scene_resolution_read(&state);
+    CHECK(state.requested_height == 720 && state.scene_width == 1110 && state.scene_height == 540 &&
+          state.output_width == 2220 && state.output_height == 1080,
+          "局内分辨率：当前实测与待应用请求分离，UI尺寸保留");
+    dm_3d_scale_feed(80.0);
+    dm_scene_resolution_read(&state);
+    CHECK(state.requested_height == 720, "局内分辨率：慢帧不会覆盖手动档位");
+    CHECK(dm_scene_resolution_request(0) == 0, "局内分辨率：可解除手动覆盖");
+    atomic_store(&g_scene_dimensions, 0);
+    free(renderer);
+}
 int main(void) {
+    test_scene_resolution();
     test_scale3d();
     unsetenv("DM_OE_SCRIPT"); reset();
     CHECK(empty(), "初始空队列：返回false且不改输出");

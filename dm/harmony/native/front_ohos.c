@@ -16,6 +16,7 @@
 #include "../../ios/Sources/dm_touch_game_state.h"
 #include "touch_ohos.h"
 #include <math.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <string.h>
@@ -32,6 +33,12 @@ void front_gtx_register(int who);
 static void *_Atomic g_window;
 static _Atomic int g_screen_w, g_screen_h;
 void front_android_set_window(void *win, int w, int h) { atomic_store(&g_window, win); if (w > 0 && h > 0) { atomic_store(&g_screen_w, w); atomic_store(&g_screen_h, h); } }
+// Shared Vulkan presentation queries the actual surface size on both platforms.
+int front_android_window_size(int *w, int *h) {
+    if (!w || !h) return 0;
+    *w = atomic_load(&g_screen_w); *h = atomic_load(&g_screen_h);
+    return *w > 0 && *h > 0;
+}
 
 static _Atomic int g_refresh_millihz;
 void front_android_set_refresh(float hz) {
@@ -202,6 +209,8 @@ static void gtx_try_activate(void) {   // 主线程和渲染线程都登记了�
 // boosts their scheduling / clocks. Start-up: APP_LAUNCH (LONG, at most 60 s) once the render thread registers, ended when the main menu appears (MainMenuButtonRibbon); each
 // run / area loading screen: PAGE_LOAD (MEDIUM, at most 10 s), ended when it is taken down. Loaded at run time with dlopen: skipped when unsupported; rate limits (interval too
 // short etc.) are only logged. DM_PERFHINT=0 disables.
+#if __has_include(<FASTKit/scheduling_optimization.h>)
+#define DM_HAVE_FASTKIT 1
 #include <FASTKit/scheduling_optimization.h>
 static struct {
     int tried, launch_on, load_on;
@@ -237,21 +246,30 @@ static void ph_send(HMS_FAST_SchedulingOptimization_SceneType type, int begin, H
     LOG("PerfHint：%s %s（%d 个线程）→ %d", what, begin ? "开始" : "结束", n, r);
 }
 void dm_platform_menu_ready(void) { pthread_mutex_lock(&g_gtx_mu); if (g_ph.launch_on) { g_ph.launch_on = 0; ph_send(HMS_FAST_APP_LAUNCH, 0, HMS_FAST_LONG, "启动"); } pthread_mutex_unlock(&g_gtx_mu); }
+#else
+// FAST Kit is an optional API 26 load hint. Older SDKs retain QoS and OpenGTX.
+#define DM_HAVE_FASTKIT 0
+void dm_platform_menu_ready(void) {}
+#endif
 // who：0 游戏主线程 1 渲染（翻译）线程 2 其他关键线程（出图 / 音频）| who: 0 game main thread, 1 render (translation) thread, 2 other key threads (present / audio)
 void front_gtx_register(int who) {
     pthread_mutex_lock(&g_gtx_mu);
     int tid = (int)gettid();
     if (who == 0) g_gtx.main_tid = tid; else if (who == 1) g_gtx.render_tid = tid; else if (g_gtx.nkeys < 5) g_gtx.key_tids[g_gtx.nkeys++] = tid;
     gtx_try_activate();
+#if DM_HAVE_FASTKIT
     if (who == 1 && g_gtx.main_tid && !g_ph.tried) { g_ph.launch_on = 1; ph_send(HMS_FAST_APP_LAUNCH, 1, HMS_FAST_LONG, "启动"); }
+#endif
     pthread_mutex_unlock(&g_gtx_mu);
 }
 // 场景：1 局内 2 读取 3 前端页 | Scene: 1 in a run 2 loading 3 front-end pages
 void front_gtx_scene(int scene) {
+#if DM_HAVE_FASTKIT
     { static int last; if (scene != last) { pthread_mutex_lock(&g_gtx_mu);   // 读取画面进出：PerfHint PAGE_LOAD | loading screen in / out: PerfHint PAGE_LOAD
         if (scene == 2 && !g_ph.load_on) { if (g_ph.launch_on) { g_ph.launch_on = 0; ph_send(HMS_FAST_APP_LAUNCH, 0, HMS_FAST_LONG, "启动"); } g_ph.load_on = 1; ph_send(HMS_FAST_PAGE_LOAD, 1, HMS_FAST_MEDIUM, "读取画面"); }
         else if (scene != 2 && g_ph.load_on) { g_ph.load_on = 0; ph_send(HMS_FAST_PAGE_LOAD, 0, HMS_FAST_MEDIUM, "读取画面"); }
         last = scene; pthread_mutex_unlock(&g_gtx_mu); } }
+#endif
     if (g_gtx.active != 1 || !g_gtx.scene_info || scene == g_gtx.scene) return;
     pthread_mutex_lock(&g_gtx_mu);
     if (scene != g_gtx.scene) {

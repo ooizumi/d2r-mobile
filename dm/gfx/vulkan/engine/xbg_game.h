@@ -72,6 +72,13 @@ int xbg_game_profile_cpu(uint64_t first_frame,uint32_t frame_count);
  * with no concurrent hostPerf/provenance/capture. Return0 schedules next full frame;
  * missing completion callback is INCOMPLETE, never elapsed-time success. */
 int xbg_game_profile_cpu_live(uint32_t frame_count);
+/* Durable vk-pipeline-list.bin lifecycle hooks. request is non-blocking and
+ * schedules list-only persistence; it never serializes the Vulkan pipeline
+ * cache. wait_* returns 1 when no list bytes remain pending, 0 on timeout or a
+ * retained I/O failure. Safe to call while the renderer is running; call
+ * request from Android onPause before the process becomes killable. */
+void xbg_game_request_pipeline_list_save(void);
+int xbg_game_wait_pipeline_list_save(uint32_t timeout_ms);
 int xbg_game_shutdown(void); /* all game threads must have exited */
 void *xbg_nvn_get_proc_address(const char *name);
 const char *xbg_game_last_error(void);

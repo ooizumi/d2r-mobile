@@ -3,7 +3,7 @@
 #   做出来的是 <输出目录>/android/：out/（改写后的游戏程序与配套表）、shaders/（Vulkan 着色器包）、overlay/（触屏覆盖层与界面素材）、
 #   overlay_variants/（「物品注释与旧译名」等走覆盖层的开关打开时用的覆盖层）、
 #   derived.tsv（几张从游戏文件生成的数据表）、pack_info.txt（做给哪一版 App）。游戏文件只在本机读，不上传；这个文件夹里有游戏内容，请只自己用，不要分发。
-# 用法：d2rm_android.py [--warm-seed <预热种子>] <游戏文件目录> <输出目录>
+# 用法：d2rm_android.py [--warm-seed <预热种子>] [--astc-pack <旧机型补充包目录>] <游戏文件目录> <输出目录>
 #   游戏文件目录 = Switch 版 3.3.94012 的 Update 目录，里面有 ExeFS/{main,sdk} 与 RomFS/data/…（怎么从自己的游戏导出）
 #   工作目录（缓存与中间产物）：环境变量 DM_ROOT，缺省 ~/dm-work；每一步做过就跳过
 #   --warm-seed <文件>：把预热种子放进包里的 shaders/（不给就不带；种子放在仓库外，免得被提交）。首次启动、还没有自己的管线列表时，引擎按种子先建好
@@ -18,7 +18,7 @@
 #   The result is <output directory>/android/: out/ (the rewritten game program and its tables), shaders/ (Vulkan shader bundles), overlay/ (touch overlay and UI art),
 #   overlay_variants/ (the overlays used when switches that go through the overlay, such as "item notes and old names", are on),
 #   derived.tsv (a few data tables generated from the game files), pack_info.txt (which App release it is for). Game files are only read on this machine, never uploaded; this folder contains game content, keep it to yourself and do not distribute it.
-# Usage: d2rm_android.py [--warm-seed <seed file>] <game files directory> <output directory>
+# Usage: d2rm_android.py [--warm-seed <seed file>] [--astc-pack <Legacy Device Pack directory>] <game files directory> <output directory>
 #   game files directory = the Update directory of the Switch version 3.3.94012, with ExeFS/{main,sdk} and RomFS/data/... (how to export them from your own game: docs/GAME_FILES)
 #   working directory (caches and intermediate products): environment variable DM_ROOT, default ~/dm-work; each step that is done is skipped
 #   --warm-seed <file>: put the warm-up seed into the pack's shaders/ (none without the option; keep seeds outside the repository so they are not committed). On a first launch,
@@ -30,7 +30,7 @@
 # It does the same as d2rm_pack.py (the iOS shell): the game program is rewritten for the Android target, and the shaders become the bundles Vulkan uses (dm/gfx/tools/dmsh_vk.py) instead of a Metal library.
 # HarmonyOS: d2rm_android.py --target ohos <game files directory> <output directory> writes <output directory>/harmony/dm/: the game program is rewritten for HarmonyOS (out/ cannot be shared with Android), the shader bundles are the same as Android's,
 #   plus ui-art/ (9 skill-button labels lbl_* and 9 skill silhouettes sil_*, taken from the bottom-bar art generator's output); copy the dm folder into a "D2R Mobile" folder on the phone next to the data folder with the game resources, and pick that folder when the app asks to import.
-import hashlib, os, shutil, struct, subprocess, sys, time
+import hashlib, json, os, shutil, struct, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__)); DM = os.path.dirname(HERE); IOS = os.path.join(DM, 'ios'); GT = os.path.join(DM, 'gfx', 'tools')
 sys.path.insert(0, HERE); from d2rm_pack import ROOT, PY, MODS, say, die, run, step, game_layout, place_xlate   # 共用 iOS 壳工具的执行与跳步框架（含 Windows 换行处理） | the run-and-skip framework shared with the iOS shell tool (including the Windows line-ending handling)
@@ -111,15 +111,42 @@ def warm_seed(seed, shaders):
     return digest
 
 
+def astc_pack_load(path):
+    """读参数时先核 ASTC 补充包；返回 (目录, pack.json, 摘要)，没给返回 None。
+    Validate the ASTC pack at argument time; return (directory, pack info, digest), or None when omitted."""
+    if not path: return None
+    path = os.path.abspath(path)
+    if not os.path.isdir(path): die('没有这个 ASTC 补充包目录：%s' % path)
+    for rel in ('pack_index.tsv', 'pack.json', 'Legacy Device Pack/manifest.json'):
+        if not os.path.isfile(os.path.join(path, rel)): die('ASTC 补充包缺少 %s：%s' % (rel, path))
+    try:
+        with open(os.path.join(path, 'pack.json'), encoding='utf-8') as f: info = json.load(f)
+        name, size = info['name'], int(info['size'])
+        digest = info['sha256']
+        if name != '00-00000008.data': raise ValueError('档名必须是 00-00000008.data')
+        if size <= 0 or not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdefABCDEF' for c in digest): raise ValueError('大小 / SHA-256')
+    except Exception as e: die('ASTC 补充包 pack.json 无效：%s' % e)
+    archive = os.path.join(path, 'Legacy Device Pack', 'data', name)
+    if not os.path.isfile(archive) or os.path.getsize(archive) != size: die('ASTC 补充包数据档缺失或大小不符：%s' % archive)
+    h = hashlib.sha256()
+    with open(archive, 'rb') as f:
+        for block in iter(lambda: f.read(64 << 20), b''): h.update(block)
+    if h.hexdigest().lower() != digest.lower(): die('ASTC 补充包数据档 SHA-256 不符：%s' % archive)
+    return path, info, digest.lower()
+
+
 def main():
-    args = sys.argv[1:]; T = 'android'; seed = None
+    args = sys.argv[1:]; T = 'android'; seed = None; astc = None
     while args and args[0].startswith('--') and len(args) >= 2:
         if args[0] == '--target': T = args[1]
         elif args[0] == '--warm-seed': seed = os.path.abspath(args[1])
+        elif args[0] == '--astc-pack': astc = args[1]
         else: break
         args = args[2:]
-    if len(args) != 2 or T not in ('android', 'ohos'): sys.exit('用法：d2rm_android.py [--target ohos] [--warm-seed <预热种子>] <游戏文件目录> <输出目录>')
+    if len(args) != 2 or T not in ('android', 'ohos'): sys.exit('用法：d2rm_android.py [--target ohos] [--warm-seed <预热种子>] [--astc-pack <旧机型补充包目录>] <游戏文件目录> <输出目录>')
+    if T != 'android' and astc: sys.exit('--astc-pack 只用于 Android')
     seed = warm_seed_load(seed)
+    astc = astc_pack_load(astc)
     game, dst = (os.path.abspath(x) for x in args)
     for st in (sys.stdout, sys.stderr):
         try: st.reconfigure(errors='replace')
@@ -166,7 +193,10 @@ def main():
     say('生成覆盖层')
     # 安卓没有 iCloud（自定义页那一行只有 iOS / Mac 的 cloud_ios.m 读）：DM_OVERLAY_NO_ICLOUD=1 让 touch_layout.py 不出这一行
     # Android has no iCloud (only iOS / Mac cloud_ios.m reads that Custom page row): DM_OVERLAY_NO_ICLOUD=1 makes touch_layout.py leave the row out
-    run([PY, os.path.join(IOS, 'tools', 'gen_romfs_overlay.py'), romfs, os.path.join(stage, 'overlay')], cwd=IOS, env=dict({'DM_ROMFS_SRC': romfs}, **({'DM_OVERLAY_NO_ICLOUD': '1'} if T == 'android' else {})), log=os.path.join(stage, 'gen_overlay.log'), what='生成覆盖层')
+    ov_env = {'DM_ROMFS_SRC': romfs}
+    if T == 'android': ov_env['DM_OVERLAY_NO_ICLOUD'] = '1'
+    if astc: ov_env['DM_ASTC_PACK'] = astc[0]
+    run([PY, os.path.join(IOS, 'tools', 'gen_romfs_overlay.py'), romfs, os.path.join(stage, 'overlay')], cwd=IOS, env=ov_env, log=os.path.join(stage, 'gen_overlay.log'), what='生成覆盖层')
     sys.path.insert(0, os.path.join(DM, 'android', 'tools')); import stage_touch_assets
     hud = os.path.join(IOS, 'Gen', 'assets', 'NativeHUD', 'v4', 'hud_v4_ui')
     stage_touch_assets.stage(os.path.join(gen, 'TouchArt'), hud, os.path.join(stage, 'overlay'))
@@ -203,6 +233,7 @@ def main():
     with open(os.path.join(stage, 'pack_info.txt'), 'w', encoding='utf-8', newline='\n') as f:
         f.write('PRODUCT=%s\nTARGET=%s\nMADE=%s\n' % (P, T, time.strftime('%Y-%m-%dT%H:%M:%S')))
         if seed_digest: f.write('WARM_SEED=%s\n' % seed_digest)
+        if astc: f.write('ASTC_PACK=%s\n' % astc[2])
     part = final + '.part'
     shutil.rmtree(part, ignore_errors=True); os.makedirs(part)
     for x in ('out', 'shaders', 'overlay') + (('ui-art',) if T == 'ohos' else ()): shutil.copytree(os.path.join(stage, x), os.path.join(part, x))
@@ -212,6 +243,17 @@ def main():
     # Custom switches that go through the overlay (item notes and old translated names, #191): gen_romfs_overlay.py writes a complete overlay per
     # switch combination next to overlay; the Android App picks one by the switches at start and layers it in front of overlay (jni_android.c)
     if T == 'android' and os.path.isdir(os.path.join(stage, 'overlay_variants')): shutil.copytree(os.path.join(stage, 'overlay_variants'), os.path.join(part, 'overlay_variants'))
+    if T == 'android' and astc:
+        if not os.path.isdir(os.path.join(stage, 'overlay_astc')): die('ASTC 覆盖层没有生成（见 gen_overlay.log）')
+        bv = os.path.join(stage, 'overlay_variants'); av = os.path.join(stage, 'overlay_astc_variants')
+        if os.path.isdir(bv):
+            if not os.path.isdir(av) or sorted(os.listdir(bv)) != sorted(os.listdir(av)): die('ASTC 覆盖层的开关组合与基础覆盖层不一致')
+        for item in ('overlay_astc', 'overlay_astc_variants'):
+            src = os.path.join(stage, item)
+            if os.path.isdir(src): shutil.copytree(src, os.path.join(part, item))
+        shutil.copytree(os.path.join(astc[0], 'Legacy Device Pack'), os.path.join(part, 'Legacy Device Pack'))
+        open(os.path.join(part, 'gfx-astc-pack'), 'w', encoding='ascii').write(astc[2] + '\n')
+        say('带 ASTC 补充包：%s（SHA-256 %s…）' % (astc[0], astc[2][:12]))
     shutil.rmtree(final, ignore_errors=True); os.replace(part, final)
     size = sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(final) for f in fs)
     if T == 'ohos': say('好了：%s（%.0f MB）。在手机上建一个「D2R Mobile」文件夹，把这个 dm 文件夹和游戏资源（%s 整个拷过去，叫 data）并排放进去，'

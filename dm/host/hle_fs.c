@@ -21,6 +21,7 @@
 #include <stdatomic.h>
 #include <sys/clonefile.h>
 #include <sys/xattr.h>
+#include "dm_cloud_files.h"
 
 #define RES_PATH_NOT_FOUND 0x202u      // fs 模块 2，描述 1 | fs module 2, description 1
 #define RES_PATH_EXISTS    0x402u      // fs 模块 2，描述 2 | fs module 2, description 2
@@ -450,6 +451,20 @@ void (*g_dm_pre_commit_hook[5])(const char *workdir);   // 提交前调（工作
 void (*g_dm_save_commit_hook)(const char *commit_dir);   // 存档提交成功后调（已提交目录）；iOS 的 iCloud 同步设它，宿主为空 | called after a save commit succeeds (committed directory); the iOS iCloud sync sets it, NULL on the host
 static _Atomic uint64_t g_save_commits;   // 成功提交过几次（前端进后台时等「游戏这次存盘已提交」用） | number of successful commits (used by the front end when going to background to wait for "the game's current save has been committed")
 uint64_t dm_fs_commit_count(void) { return atomic_load(&g_save_commits); }
+// Mobile cloud clients copy the committed tree while Commit is excluded.
+// Network requests happen after returning; they never hold a game save lock.
+int dm_fs_cloud_snapshot(const char *root, const char *target) {
+    PATH_LOCK(); pthread_mutex_lock(&g_lock);
+    int rc = dm_cloud_snapshot_files(root, target);
+    pthread_mutex_unlock(&g_lock); return rc;
+}
+int dm_fs_cloud_install(const char *root, const char *target) {
+    PATH_LOCK(); pthread_mutex_lock(&g_lock);
+    int rc = 0;
+    for (int i = 0; i < g_nmnt; i++) if (g_mnt[i].commit[0]) { rc = -EBUSY; break; }
+    if (!rc) rc = dm_cloud_install_files(root, target);
+    pthread_mutex_unlock(&g_lock); return rc;
+}
 HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv；事务式存档：工作目录整树 clone 后与已提交目录原子互换（renamex_np RENAME_SWAP）", Result, h_fs_Commit, const char *name) {
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
     int i = 0; while (i < g_nmnt && strcmp(g_mnt[i].name, name)) i++;

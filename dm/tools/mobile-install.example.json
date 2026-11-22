@@ -1,0 +1,39 @@
+{
+  "target": "ohos",
+  "workspace": "/path/to/private/d2r-work",
+  "game_dir": "/path/to/your/Update",
+  "roms": [],
+  "keys": "",
+  "resource": {
+    "hactool": "",
+    "warm_seed": "",
+    "astc_pack": ""
+  },
+  "build": {
+    "sdk": "",
+    "deveco": "/Applications/DevEco-Studio.app",
+    "gradle": "",
+    "java_home": "",
+    "python": "",
+    "gen_dir": "",
+    "build_profile": "",
+    "app_id": "com.xiao.boluo",
+    "label": "暗黑2",
+    "sdk_version": "",
+    "build_mode": "debug"
+  },
+  "device": {
+    "bridge": "",
+    "serial": "",
+    "remote_dir": "",
+    "import_mode": "debug-sandbox",
+    "launch": false
+  },
+  "install": {
+    "artifact": "",
+    "resources": ""
+  },
+  "export": {
+    "output": "/path/to/private/D2R-source.zip"
+  }
+}

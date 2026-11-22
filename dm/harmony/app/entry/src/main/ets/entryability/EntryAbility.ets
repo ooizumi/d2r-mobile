@@ -6,10 +6,15 @@ import { window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import dm from 'libdm.so';
 import { refreshForms } from '../entryformability/EntryFormAbility';
+import { cloudSaveOnBackground, cloudSaveOnDestroy } from '../utils/CloudSave';
 
 export default class EntryAbility extends UIAbility {
+  onDestroy(): void { cloudSaveOnDestroy(this.context.filesDir); }
   // 退到后台时刷新桌面卡片（存档此时已写完）| Refresh the home-screen cards when going to the background (the saves are written by then)
-  onBackground(): void { refreshForms(this.context.filesDir); }
+  onBackground(): void {
+    refreshForms(this.context.filesDir);
+    cloudSaveOnBackground(this.context.filesDir);
+  }
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     AppStorage.setOrCreate('filesDir', this.context.filesDir);
     AppStorage.setOrCreate('lang', this.context.config.language ?? 'zh');

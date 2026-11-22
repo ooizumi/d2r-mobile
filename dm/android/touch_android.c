@@ -1,5 +1,6 @@
 #include "touch_android.h"
 #include "front_android.h"
+#include "../host/dm.h"
 #include "../ios/Sources/dm_touch_controls.h"
 #include "../host/dm_input.h"
 #include "../host/dm_cursor.h"
@@ -9,7 +10,11 @@
 #include "../host/dm_world.h"
 #include "../host/dm_uiscreen.h"
 #include "../ios/Sources/dm_touch_native_art.h"
+#ifdef __ANDROID__
+#include <jni.h>
+#endif
 #include <pthread.h>
+#include <stdatomic.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +27,12 @@ void dm_touch_game_set_scene(int game, uint64_t scene, uint64_t world) __attribu
 
 typedef struct { int phase, slot; float x, y; double time; } touch_event;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int hud_diag_enabled;
+static uint64_t hud_diag_last_slow_ns;
+static int hud_diag_seen, hud_diag_last_visible;
+static int hud_diag_last_binding_stale;
+static uint32_t hud_diag_last_buttons, hud_diag_last_glyphs;
+static dm_ta_visual_cache native_visual;
 static dm_tc_state tc;
 static dm_tc_scene scene;
 /* 面板栈读数（宿主 dm_cursor.c dm_hud_stack_msg，iOS / Mac 同一份）：开着的非常驻面板数，只开着 NPC 对话菜单时 −1
@@ -54,6 +65,13 @@ static unsigned seen_world, seen_mouse, seen_tab, seen_use, seen_ident, seen_lon
    without it the front end is the original controller page and keeps the navigation keys. */
 static int frontend, fe_slot = -1, fe_drag;
 static float fe_x0, fe_y0;
+
+#ifdef __ANDROID__
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_TouchOverlay_nativeHudDiag(JNIEnv *env, jclass cls, jboolean on) {
+    (void)env; (void)cls;
+    atomic_store(&hud_diag_enabled, on != JNI_FALSE);
+}
+#endif
 /* 面板态的五个虚拟手柄圆钮：缺省不给（同 iOS front_ios.m navigationMode：点按 / 双击 / 拖放 / 点页签 / 面板外点按已全部替代）；DM_TOUCH_NAV_PAD=1 调试时叫回来
    The five virtual pad buttons in panel state: off by default (as iOS front_ios.m navigationMode: tap / double tap / drag / tab tap / tap outside
    the panel replace them all); DM_TOUCH_NAV_PAD=1 brings them back for debugging */
@@ -432,7 +450,11 @@ void dm_android_touch_step(uint64_t guest_now, uint64_t *buttons, int32_t *lx, i
     pthread_mutex_unlock(&lock);
 }
 void dm_android_touch_layout(float out[DM_ANDROID_TOUCH_DRAW_FLOATS]) {
-    pthread_mutex_lock(&lock); init_locked();
+    int diag = atomic_load(&hud_diag_enabled);
+    uint64_t started_ns = diag ? now_ns() : 0;
+    pthread_mutex_lock(&lock);
+    uint64_t locked_ns = diag ? now_ns() : 0;
+    init_locked();
     memset(out,0,sizeof(float)*DM_ANDROID_TOUCH_DRAW_FLOATS);
     out[0]=tc.layout.width; out[1]=tc.layout.height; out[2]=tc.navigation_mode; out[3]=tc.skill_set;
     for (int i=0;i<23;++i) {
@@ -459,17 +481,6 @@ void dm_android_touch_layout(float out[DM_ANDROID_TOUCH_DRAW_FLOATS]) {
         if (frontend) p[3]=0;   /* 前端页面不画控件（见 frontend） | No controls drawn on front-end pages (see frontend) */
     }
     dm_tg_snapshot native; dm_touch_game_snapshot(&native);
-    for (int i=0;i<6;++i) {
-        float *p=out+DM_ANDROID_TOUCH_GLYPHS+i*8;
-        dm_ta_glyph g=i==5 ? dm_ta_skill(359) : dm_ta_current_set(&native,tc.layout.target[i].button,now_ns(),tc.skill_set);
-        dm_ta_frame frame;
-        p[0]=g.status; p[1]=g.atlas;
-        int held=out[4+i*5+4]!=0;
-        if (g.status==DM_TA_GLYPH && dm_ta_frame_at(g.atlas,held?g.pressed_frame:g.normal_frame,&frame)) {
-            p[2]=frame.x; p[3]=frame.y; p[4]=frame.width; p[5]=frame.height;
-            if (g.slot>=0) { int charges=0; p[6]=dm_swapskill_slot(g.slot,&charges); p[7]=charges; }
-        }
-    }
     dm_hud_info h; dm_hud_get(&h);
     float *hud=out+DM_ANDROID_TOUCH_HUD;
     hud[0]=!frontend && dm_hud_bar_visible(&h,tc.navigation_mode && !dm_tc_scene_dialog_only(&scene),hud_blocked>0);
@@ -478,5 +489,55 @@ void dm_android_touch_layout(float out[DM_ANDROID_TOUCH_DRAW_FLOATS]) {
     hud[7]=h.players; hud[8]=h.hp; hud[9]=h.hp_max; hud[10]=h.mp; hud[11]=h.mp_max;
     hud[12]=h.points; hud[13]=h.quest_unread; hud[14]=h.dead; hud[15]=tc.map_cancel_active;
     hud[16]=tc.lx; hud[17]=tc.ly;   /* 摇杆推量（−32767..32767），画摇杆头用，同 iOS DmTouchOverlay | stick deflection (−32767..32767) for drawing the thumb, as iOS DmTouchOverlay */
+    int hud_visible = hud[0] != 0;
+    if (!hud_visible) dm_ta_visual_reset(&native_visual);
+    uint64_t glyph_now_ns = now_ns(), sample_token = dm_input_samples();
+    for (int i=0;i<6;++i) {
+        float *p=out+DM_ANDROID_TOUCH_GLYPHS+i*8;
+        dm_ta_glyph g=i==5 ? dm_ta_skill(359) : hud_visible ?
+            dm_ta_visual_current_set(&native_visual,&native,tc.layout.target[i].button,glyph_now_ns,
+                                     sample_token,epoch,world,tc.skill_set) :
+            dm_ta_current_set(&native,tc.layout.target[i].button,glyph_now_ns,tc.skill_set);
+        dm_ta_frame frame;
+        p[0]=g.status; p[1]=g.atlas;
+        int held=out[4+i*5+4]!=0;
+        if (g.status==DM_TA_GLYPH && dm_ta_frame_at(g.atlas,held?g.pressed_frame:g.normal_frame,&frame)) {
+            p[2]=frame.x; p[3]=frame.y; p[4]=frame.width; p[5]=frame.height;
+            if (g.slot>=0) { int charges=0; p[6]=dm_swapskill_slot(g.slot,&charges); p[7]=charges; }
+        }
+    }
+    int visible = hud[0] != 0, navigation_hide = tc.navigation_mode && !dm_tc_scene_dialog_only(&scene);
+    int dialog_only = dm_tc_scene_dialog_only(&scene), blocked = hud_blocked > 0;
+    int game = scene.game, frontend_now = frontend, navigation = tc.navigation_mode, valid = h.valid, dead = h.dead;
+    uint64_t panels = scene.panels, scene_epoch = epoch, world_epoch = world;
+    uint32_t visible_buttons = 0, glyph_states = 0;
+    if (diag) {
+        for (int i = 0; i < 23; ++i) if (out[4+i*5+3] != 0) visible_buttons |= 1u << i;
+        for (int i = 0; i < 6; ++i) glyph_states |= ((uint32_t)(int)out[DM_ANDROID_TOUCH_GLYPHS+i*8] & 15u) << (i*4);
+    }
     pthread_mutex_unlock(&lock);
+    if (diag) {
+        uint64_t ended_ns = now_ns(), lock_ns = locked_ns - started_ns, total_ns = ended_ns - started_ns;
+        int binding_stale = native.captured_ns && glyph_now_ns >= native.captured_ns &&
+                            glyph_now_ns - native.captured_ns > DM_TG_MAX_AGE_NS;
+        if ((total_ns >= 50000000ull || lock_ns >= 50000000ull) &&
+            (!hud_diag_last_slow_ns || ended_ns - hud_diag_last_slow_ns >= 1000000000ull)) {
+            hud_diag_last_slow_ns = ended_ns;
+            LOG("hudprof-native slow t_ms=%llu layout_ms=%.1f lock_ms=%.1f work_ms=%.1f",
+                (unsigned long long)(ended_ns / 1000000ull), total_ns / 1e6f, lock_ns / 1e6f,
+                (ended_ns - locked_ns) / 1e6f);
+        }
+        if (!hud_diag_seen || visible != hud_diag_last_visible || visible_buttons != hud_diag_last_buttons || glyph_states != hud_diag_last_glyphs || binding_stale != hud_diag_last_binding_stale) {
+            long long bind_age_ms = native.captured_ns && ended_ns >= native.captured_ns ?
+                (long long)((ended_ns - native.captured_ns) / 1000000ull) : -1;
+            LOG("hudprof-native visibility t_ms=%llu visible=%d frontend=%d game=%d panels=%#llx nav=%d dialog_only=%d nav_hide=%d blocked=%d valid=%d dead=%d bind_supported=%d bind_valid=%d bind_ready=%d bind_age_ms=%lld bind_scope=%d bind_scene=%llu bind_world=%llu scene=%llu world=%llu buttons=%#x glyphs=%#x",
+                (unsigned long long)(ended_ns / 1000000ull), visible, frontend_now, game, (unsigned long long)panels,
+                navigation, dialog_only, navigation_hide, blocked, valid, dead, native.supported, native.valid,
+                native.ready, bind_age_ms, native.identity_scope, (unsigned long long)native.scene_epoch,
+                (unsigned long long)native.world_epoch, (unsigned long long)scene_epoch, (unsigned long long)world_epoch, visible_buttons, glyph_states);
+            hud_diag_seen = 1; hud_diag_last_visible = visible;
+            hud_diag_last_binding_stale = binding_stale;
+            hud_diag_last_buttons = visible_buttons; hud_diag_last_glyphs = glyph_states;
+        }
+    }
 }

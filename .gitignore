@@ -25,3 +25,19 @@ dm/android/.cxx/
 /private/
 /artifacts/
 dm/android/local.env
+# Private pairing, user-owned game inputs, and local test/build caches.
+cloud-save.json
+prod.keys
+title.keys
+*.nsp
+*.xci
+*.nca
+__pycache__/
+*.py[cod]
+dm/harmony/app/.hvigor/
+dm/harmony/app/oh_modules/
+dm/harmony/app/build/
+dm/harmony/app/entry/build/
+dm/harmony/app/entry/.cxx/
+dm/harmony/app/entry/oh_modules/
+dm/harmony/app/local.properties

@@ -1,17 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 只要一个权限：所有文件访问（读玩家放在 Download/S2X/D2R Mobile/data 的游戏资源）。不联网、不要别的权限。 -->
-<!-- Only one permission: all files access (to read the game resources the player puts in Download/S2X/D2R Mobile/data). No network, no other permissions. -->
+<!-- Files access reads game resources; network is used only for the independent cloud-save service. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
     <application
-        android:label="@string/dmAndroidName"
+        android:label="${dmAppLabel}"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:hasFragileUserData="true"
         android:appCategory="game"
         android:isGame="true"
         android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
         <activity
             android:name=".DmActivity"

@@ -17,6 +17,7 @@ import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.graphics.ColorMatrix;
 import android.graphics.ColorMatrixColorFilter;
+import android.util.Log;
 import android.view.Choreographer;
 import android.view.MotionEvent;
 import android.view.View;
@@ -36,6 +37,7 @@ public final class TouchOverlay extends View {
     private static native void nativeEvent(int phase, int slot, float x, float y);
     private static native void nativeResize(float width, float height, float left, float right, float bottom, boolean tablet);
     private static native void nativeLayout(float[] out);
+    private static native void nativeHudDiag(boolean on);
     // 游戏视图矩形（px，窗口坐标系）：真全屏局内是贴底的 16:9 界面矩形，局外是居中的 16:9，没开真全屏 = 整窗。
     // The game view rect (px, window coordinates): the bottom-anchored 16:9 UI block in a true-fullscreen run, the centered
     // 16:9 outside it, the whole window without true fullscreen.
@@ -54,12 +56,14 @@ public final class TouchOverlay extends View {
     // Game view rect: the full-window view still receives every touch, but drawing and hit points use this rectangle (smaller
     // than the window in true fullscreen); compared every frame, native is told and the view redraws only when it changes.
     private boolean debugNoHud;
+    private static final boolean HUD_PROFILE = BuildConfig.DEBUG;
     private final int[] viewRect = new int[4], lastRect = new int[4];
     private boolean rectValid;
     private float viewXdp, viewYdp, viewWdp, viewHdp;
     private final Choreographer.FrameCallback poll = new Choreographer.FrameCallback() {
         @Override public void doFrame(long frameTimeNanos) {
             if (!running) return;
+            logOverlayStateTransition("poll");
             if (inputEnabled && isShown()) {
                 boolean moved = syncViewRect();
                 nativeLayout(probe);
@@ -82,7 +86,9 @@ public final class TouchOverlay extends View {
     private final String lifeFormat, manaFormat, levelFormat, cancelLabel;
     private JSONObject hudUi;
     private float safeLeft, safeRight, safeBottom;
-    private boolean running, inputEnabled;
+    private boolean running, inputEnabled, assetsLoaded;
+    private boolean overlayStateSeen, lastInputEnabled, lastShown, lastActive, lastAttached;
+    private int lastVisibility = -1, lastWindowVisibility = -1;
 
     /** labels为本地化表中的15项：12键、摇杆、换组、难度；menuLabels为导航态前五键。 | Pass 15 localized game labels and five navigation labels from the shared string table. */
     public TouchOverlay(Context context, String[] labels, String[] menuLabels) {
@@ -107,8 +113,11 @@ public final class TouchOverlay extends View {
         if (inputEnabled==enabled) return;
         if (!enabled) cancelTouches();
         inputEnabled=enabled;
+        if (HUD_PROFILE) nativeHudDiag(enabled);
         drawnValid=false; invalidate();
-        if (enabled) {
+        // Imported art is immutable for this view's lifetime. Pause/resume only changes input;
+        // decoding the same atlases again creates a large allocation burst on the UI thread.
+        if (enabled && !assetsLoaded) {
             images.clear(); art.clear(); glyphs.clear(); glowOffsets.clear();
             for(int i=0;i<skillAtlases.length;i++) {
                 skillAtlases[i]=image("touchart/dm_native_skill_"+i+".png"); silAtlases[i]=image("hud_v4_ui/sil_dm_native_skill_"+i+".png");
@@ -116,8 +125,25 @@ public final class TouchOverlay extends View {
             mapArt=image("touchart/dm_native_map.png"); circleArt=image("touchart/dm_native_circle.png"); socketArt=image("touchart/dm_mobile_socket.png");
             try { hudUi=new JSONObject(new String(Files.readAllBytes(new File(overlayRoot,"hud_v4_ui/ui.json").toPath()),StandardCharsets.UTF_8)); }
             catch(Exception ignored) { hudUi=null; }
-            resizeNative();
+            assetsLoaded=true;
+            if (HUD_PROFILE) android.util.Log.i("dm", "hudprof-assets loaded images=" + images.size());
         }
+        if (enabled) resizeNative();
+        logOverlayStateTransition("input");
+    }
+    private void logOverlayStateTransition(String reason) {
+        if (!HUD_PROFILE) return;
+        // Android clears attach info after onDetachedFromWindow returns.
+        boolean attached=!"detach".equals(reason) && isAttachedToWindow(), shown=attached && isShown(), active=inputEnabled && shown;
+        int visibility=getVisibility(), windowVisibility=getWindowVisibility();
+        if (overlayStateSeen && inputEnabled==lastInputEnabled && shown==lastShown && active==lastActive &&
+            attached==lastAttached && visibility==lastVisibility && windowVisibility==lastWindowVisibility) return;
+        long t=System.nanoTime()/1000000L;
+        Log.i("dm", String.format(Locale.ROOT,
+            "hudprof-java overlay t_ms=%d reason=%s input=%d shown=%d active=%d attached=%d visibility=%d window_visibility=%d",
+            t,reason,inputEnabled?1:0,shown?1:0,active?1:0,attached?1:0,visibility,windowVisibility));
+        overlayStateSeen=true; lastInputEnabled=inputEnabled; lastShown=shown; lastActive=active;
+        lastAttached=attached; lastVisibility=visibility; lastWindowVisibility=windowVisibility;
     }
     private void resizeNative() {
         // 窗口尺寸变了：先按整屏 resize，再由下一帧的 syncViewRect 把视图矩形交给 native（先 resize 再 view）。
@@ -149,11 +175,22 @@ public final class TouchOverlay extends View {
     @Override protected void onSizeChanged(int w,int h,int oldw,int oldh) {
         cancelTouches(); resizeNative();
     }
+    @Override public void setVisibility(int visibility) {
+        super.setVisibility(visibility); logOverlayStateTransition("visibility");
+    }
+    @Override protected void onVisibilityChanged(View changedView,int visibility) {
+        super.onVisibilityChanged(changedView,visibility); logOverlayStateTransition("view_visibility");
+    }
+    @Override protected void onWindowVisibilityChanged(int visibility) {
+        super.onWindowVisibilityChanged(visibility); logOverlayStateTransition("window_visibility");
+    }
     @Override protected void onAttachedToWindow() {
         super.onAttachedToWindow(); running=true; drawnValid=false; invalidate(); Choreographer.getInstance().postFrameCallback(poll);
+        logOverlayStateTransition("attach");
     }
     @Override protected void onDetachedFromWindow() {
         running=false; Choreographer.getInstance().removeFrameCallback(poll); cancelTouches(); super.onDetachedFromWindow();
+        logOverlayStateTransition("detach");
     }
     public void cancelTouches() {
         if (!inputEnabled) { Arrays.fill(pointerIds,-1); return; }

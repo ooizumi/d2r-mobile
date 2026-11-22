@@ -7,6 +7,7 @@
 #include "dm_cursor.h"
 #include "hle.h"
 #include "dm_uiscreen.h"
+#include "dm_scene_resolution.h"
 
 // 运行模式是运行时状态（前端可改：iOS 过热降级切掌机）：唯一来源在此，启动时从 DM_OPMODE 取一次，之后不再读环境变量
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
@@ -263,6 +264,41 @@ int dm_3d_quality_mode_get(void) { return atomic_load(&g_3d_quality_mode); }
 static _Atomic int g_scale3d_level;
 static _Atomic int g_scale3d_resumed;
 static _Atomic float g_s3g_scale;
+static _Atomic int g_scene_height_request;
+// All four measured dimensions fit in 16 bits; publish a coherent snapshot in
+// one atomic store instead of letting the UI read mutable guest memory.
+static _Atomic uint64_t g_scene_dimensions;
+int dm_scene_resolution_request(int height) {
+    switch (height) {
+        case 0: case 360: case 432: case 480: case 540: case 600: case 720: case 900: case 1080: break;
+        default: return -1;
+    }
+    int old = atomic_exchange(&g_scene_height_request, height);
+    if (old != height) {
+        atomic_store(&g_scale3d_level, 0);
+        atomic_store(&g_s3g_scale, 0.0f);
+        atomic_store(&g_scale3d_resumed, 1);
+        LOG("3D resolution requested height=%d (UI unchanged)", height);
+    }
+    return 0;
+}
+void dm_scene_resolution_read(dm_scene_resolution_state *out) {
+    if (!out) return;
+    uint64_t d = atomic_load(&g_scene_dimensions);
+    *out = (dm_scene_resolution_state){atomic_load(&g_scene_height_request),
+        (uint32_t)(d & 0xffff), (uint32_t)((d >> 16) & 0xffff),
+        (uint32_t)((d >> 32) & 0xffff), (uint32_t)(d >> 48)};
+}
+static float scene_height_scale(int height, uint32_t output_height) {
+    float scale = output_height ? (float)height / output_height : 1.0f;
+    return scale < (1.0f / 3.0f) ? (1.0f / 3.0f) : scale > 1.0f ? 1.0f : scale;
+}
+static void scene_dimensions_publish(uintptr_t renderer) {
+    uint64_t w = *(uint32_t *)(renderer + 0xee78), h = *(uint32_t *)(renderer + 0xee7c);
+    uint64_t ow = *(uint32_t *)(renderer + 0xee88), oh = *(uint32_t *)(renderer + 0xee8c);
+    if (w > 65535 || h > 65535 || ow > 65535 || oh > 65535) return;
+    atomic_store(&g_scene_dimensions, w | (h << 16) | (ow << 32) | (oh << 48));
+}
 // 自定义页「3D 清晰度」（dm_custom.c 键 scale3d，#149）：0 省电 0.60 / 1 均衡 = 本平台缺省（缺省档；安卓 0.85，别的手机 0.75）/ 2 清晰 1.00。读盘与点「应用」时调；只在手机上生效，DM_3D_SCALE 仍优先。
 // 换了档：两个动态控制器的档清零，从新配置值重新往下判（scale3d_tick 下一次取系统通知时按新比例重建 3D 目标）
 // The Custom page "3D resolution" (dm_custom.c key scale3d, #149): 0 power saver 0.60 / 1 balanced = the platform default (the default level; 0.85 on
@@ -321,6 +357,7 @@ static void s3g_feed(double iv_ms) {
         LOG("3D 比例控制（按 GPU 耗时）：帧 %.1f ms、GPU %.1f ms → %s到第 %d 档（3D 比例 %.2f）", fr, g, lv > old ? "降" : "升", lv, lv ? cfg * g_s3g_mult[lv - 1] : cfg); }
 }
 void dm_3d_scale_feed(double iv_ms) {   // 出图线程每帧调（diag.c dm_perf_present 转来）：实际上屏间隔 ms，−1 = 被丢弃，0 = 无读数 | called by the present thread every frame (forwarded from diag.c dm_perf_present): actual present interval in ms, −1 = dropped, 0 = no reading
+    if (atomic_load(&g_scene_height_request) > 0) return;   // explicit live selection is fixed, not an adaptive ceiling
     static scale3d_ctl c; static int on = -1; static long inj0 = -1, inj1 = -1; static float fl, mcfg = -1;
     if (on < 0) { const char *e = getenv("DM_3D_SCALE_DYN"), *j = getenv("DM_3D_SCALE_DYN_INJECT"); on = !(e && !strcmp(e, "0")) && !getenv("DM_THERMAL_NOFALLBACK");
         if (j) { inj0 = atol(j); inj1 = strchr(j, '-') ? atol(strchr(j, '-') + 1) : inj0; }
@@ -355,6 +392,10 @@ float dm_3d_scale_cur(void) { return atomic_load(&g_scale3d_cur); }
 static void scale3d_tick(void) {
     static float cur = 1.0f; static module_t *main; static int found;
     if (!found) { found = 1; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) main = &g_mod[i]; }
+    if (!main || dm_nvn_frame_count() < 30) return;
+    uintptr_t renderer = *(uintptr_t *)(main->base + 0x31e0848); if (!renderer) return;
+    uint32_t ow = *(uint32_t *)(renderer + 0xee88), oh = *(uint32_t *)(renderer + 0xee8c); if (!ow || !oh) return;
+    scene_dimensions_publish(renderer);
     // 配置值每次现取：自定义页换档后下一次就按新比例重建
     // The configured value is fetched every time: after a Custom page level change the next call rebuilds at the new scale
     float want_cfg = s3_cfg();
@@ -362,14 +403,14 @@ static void scale3d_tick(void) {
     // Dynamic level: 0 = configured value, k = the k-th table scale below the configured value
     int lv = atomic_load(&g_scale3d_level); float dyn = s3_level_scale(want_cfg, lv);
     if (s3g_on()) { float g = atomic_load(&g_s3g_scale); dyn = g > 0 && g < want_cfg ? g : want_cfg; }   // GPU 时间控制器（DM_3D_SCALE_GPU=1，鸿蒙缺省开）覆盖帧间隔档 | GPU-time controller (DM_3D_SCALE_GPU=1, on by default on HarmonyOS) overrides the frame-interval level
-    float want = dm_nvn_ruler_truth() ? 1.0f : dyn;
-    if (want == cur || !main || dm_nvn_frame_count() < 30) return;
-    uintptr_t renderer = *(uintptr_t *)(main->base + 0x31e0848); if (!renderer) return;
-    uint32_t ow = *(uint32_t *)(renderer + 0xee88), oh = *(uint32_t *)(renderer + 0xee8c); if (!ow || !oh) return;
+    int requested_height = atomic_load(&g_scene_height_request);
+    float want = dm_nvn_ruler_truth() ? 1.0f : requested_height > 0 ? scene_height_scale(requested_height, oh) : dyn;
+    if (want == cur && *(float *)(renderer + 0x66a4) == want) return;
     { extern void mtl_rt_force_full(int) __attribute__((weak)); if (mtl_rt_force_full) mtl_rt_force_full(4); }   // 运行时外推：换比例前后几帧一律全画（主通道换尺寸那帧不能外推） | runtime extrapolation: the few frames before and after a scale change are all drawn in full (the frame where the main pass changes size cannot be extrapolated)
     float *scale = (float *)(renderer + 0x66a4); dm_guest_write_prepare(scale, sizeof *scale); *scale = want;
     ((void (*)(uint32_t, uint32_t))(main->base + 0x8582f0))(ow, oh);
     cur = want; atomic_store(&g_scale3d_cur, want);
+    scene_dimensions_publish(renderer);
     LOG("3D 渲染比例 %.2f：3D 目标 %ux%u，输出 %ux%u（帧 %llu）", want, *(uint32_t *)(renderer + 0xee78), *(uint32_t *)(renderer + 0xee7c),
         *(uint32_t *)(renderer + 0xee88), *(uint32_t *)(renderer + 0xee8c), (unsigned long long)dm_nvn_frame_count());
 }

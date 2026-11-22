@@ -34,6 +34,8 @@ android {
     ndkVersion '29.0.14206865'
     defaultConfig {
         applicationId project.findProperty('dmAppId') ?: 'com.xiaoboluo.d2r'
+        // Keep parallel device builds distinguishable in the launcher and diagnostics.
+        manifestPlaceholders.dmAppLabel = project.findProperty('dmAppLabel') ?: '@string/dmAndroidName'
         // 产物代号（dm/PRODUCT 首行）：导入包的 pack_info.txt 要与它相同（DmActivity.ensureImported）
         // Product code (first line of dm/PRODUCT): an import pack's pack_info.txt must match it (DmActivity.ensureImported)
         buildConfigField 'String', 'DM_PRODUCT', "\"${file('../../PRODUCT').readLines()[0].trim()}\""
@@ -42,7 +44,7 @@ android {
         // 跟发布版本走：versionName = 发布版本号，versionCode = 主 × 10000 + 次 × 100 + 修订（2.0.0 → 20000），只增不减，旧版才能被覆盖升级
         // Follows the release: versionName = release version, versionCode = major × 10000 + minor × 100 + patch (2.0.0 → 20000), only ever increasing so older installs upgrade in place
         versionCode 20300
-        versionName '2.3.0'
+        versionName project.findProperty('dmVersionName') ?: '2.3.0'
         ndk { abiFilters 'arm64-v8a' }
         if (!prebuilt) externalNativeBuild { cmake {
             arguments "-DDM_GEN_DIR=${project.findProperty('dmGenDir') ?: ''}"

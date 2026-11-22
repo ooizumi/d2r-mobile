@@ -14,6 +14,7 @@
 #include "dm_i18n.h"
 #include "dm_custom.h"
 #include "app_mac_overlay.h"
+#include "app_cloud_mac.h"
 #define T(k) (@(dm_ui(k)))
 
 #ifndef APP_NAME
@@ -142,6 +143,17 @@ int dm_app_bootstrap(int *argc, char ***argv) {
         if (!getenv("DM_AUDIO")) setenv("DM_AUDIO", "1", 1);   // 产品要出声（hle_audio.c 在 Mac 上的缺省是给命令行回放 / 闸门的静音接收端）；无人值守测试显式 DM_AUDIO=0 | the product must play sound (on the Mac, hle_audio.c defaults to the silent sink used for command-line replays / gates); unattended tests set DM_AUDIO=0 explicitly
         setenv("DM_SAVE", save.fileSystemRepresentation, 1); setenv("DM_TEMP", temp.fileSystemRepresentation, 1);
         setenv("DM_ROMFS", rom.fileSystemRepresentation, 1); setenv("DM_ROOT", sup.fileSystemRepresentation, 1);
+        const char *httpConfig = getenv("DM_HTTP_CLOUD_CONFIG");
+        NSString *cloudConfig = httpConfig ? @(httpConfig) : [sup stringByAppendingPathComponent:@"cloud-save/config.json"];
+        if (httpConfig || [fm fileExistsAtPath:cloudConfig]) {
+            // One save tree has one coordinator. An offline HTTP session must not fall back to iCloud.
+            unsetenv("DM_CLOUD_REAL");
+            setenv("DM_HTTP_CLOUD_ACTIVE", "1", 1);
+            // LaunchServices must finish opening the app before a startup modal can wait for input.
+            [NSApp finishLaunching];
+            [NSApp activateIgnoringOtherApps:YES];
+            if (!dm_mac_cloud_boot(sup.fileSystemRepresentation, cloudConfig.fileSystemRepresentation)) exit(0);
+        }
         NSString *shmap = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"shader_map.tsv"];   // 图形后端的着色器映射表：命令行起时按可执行文件旁的源码树找，包里放在 Resources | The graphics backend's shader mapping table: when started from the command line it is found via the source tree next to the executable; in the package it is in Resources
         if ([fm fileExistsAtPath:shmap]) setenv("DM_NVN_SHMAP", shmap.fileSystemRepresentation, 1);
         NSString *msl = res_item(@"msl");   // 编好的着色器库（msl/b-<翻译链版本>/） | The compiled shader library (msl/b-<translation chain version>/)

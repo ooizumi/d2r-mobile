@@ -4,6 +4,7 @@
 #include "vulkan_present.h"
 #include "front_android.h"
 #include "../gfx/vulkan/nvn_vk.h"
+#include "../gfx/vulkan/engine/xbg_game.h"
 #include "../gfx/xtrace.h"
 #include <android/log.h>
 #include <android/native_window.h>
@@ -28,6 +29,15 @@ extern "C" double dm_present_period(void);
 // 错过上屏节拍的帧数（晚于「上次期望时刻 + 周期」2 ms 以上）；自适应出图档按它降档 / 试升
 // Frames that missed their display slot (more than 2 ms later than "previous desired time + period"); the adaptive present tier steps down / probes up by it
 static std::atomic<uint64_t> dm_present_late{0};
+static std::atomic<unsigned> dm_profile_request{0};
+// Both conditions must hold: a pending save alone must never suppress foreground presents.
+static std::atomic<unsigned> background_save_state{0};
+bool discard_present(){return background_save_state.load(std::memory_order_acquire)==3;}
+extern "C" int dm_android_vk_request_profile(int kind,int frames){
+    if(kind<1 || kind>3 || frames<1 || frames>60)return -1;
+    unsigned empty=0;
+    return dm_profile_request.compare_exchange_strong(empty,(unsigned(kind)<<16)|unsigned(frames))?0:-1;
+}
 extern "C" uint64_t dm_present_late_count(void){return dm_present_late.load(std::memory_order_relaxed);}
 namespace {
 // 图形日志写 stderr：jni_android.c 已把它接到 logcat 标签 dm 与日志文件，玩家按 `adb logcat -s dm` 或拉日志文件都能拿全。
@@ -204,12 +214,16 @@ void membench(){
     vkDestroyCommandPool(device,pool,nullptr);
 }
 int has_window(void*){std::lock_guard<std::mutex> l(window_mutex);return desired!=nullptr;}
-void wait_window(){std::unique_lock<std::mutex> lock(window_mutex);window_cv.wait(lock,[]{return desired!=nullptr;});}
+void wait_window(){std::unique_lock<std::mutex> lock(window_mutex);window_cv.wait(lock,[]{return desired!=nullptr||discard_present();});}
 bool window_changed(){std::lock_guard<std::mutex> lock(window_mutex);return !desired||generation!=active_generation;}
-void wait_window_change(uint64_t bad){std::unique_lock<std::mutex> lock(window_mutex);window_cv.wait(lock,[bad]{return generation!=bad;});}
+void wait_window_change(uint64_t bad){std::unique_lock<std::mutex> lock(window_mutex);window_cv.wait(lock,[bad]{return generation!=bad||discard_present();});}
 void wait_resize(){std::unique_lock<std::mutex> lock(window_mutex);window_cv.wait_for(lock,std::chrono::milliseconds(16),[]{return generation!=active_generation;});}
 int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uint32_t height,const int32_t crop[4],int32_t){
-    std::lock_guard<std::mutex> render_lock(render_mutex);
+    std::unique_lock<std::mutex> render_lock(render_mutex);
+    // Background autosave keeps the guest ticking after Android has withdrawn the Surface. Drop the
+    // source frame in the present callback, before any window/Vulkan wait, so ticks can reach the game's
+    // original autosave path. This gate is set and cleared only around a lifecycle-worker save request.
+    if(discard_present())return 0;
     pin_update();
     VkFormatProperties sp;vkGetPhysicalDeviceFormatProperties(physical,source_format,&sp);if(!(sp.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_SRC_BIT))return VK_ERROR_FORMAT_NOT_SUPPORTED;
     int x=0,y=0,w=int(width),h=int(height);if(crop&&crop[2]>0&&crop[3]>0){x=std::clamp(crop[0],0,w);y=std::clamp(crop[1],0,h);w=std::min(crop[2],int(width)-x);h=std::min(crop[3],int(height)-y);}if(w<=0||h<=0)return VK_ERROR_INITIALIZATION_FAILED;
@@ -231,6 +245,7 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
     // 后台等待释放UI锁；保留同一源帧，恢复并真正呈现后才返回成功。
     // Suspend without the UI lock; keep this source frame until it is presented.
     wait_window();
+    if(discard_present())return 0;
     VkResult r;
     if(!surface||window_changed()){
         if((r=vkQueueWaitIdle(queue)))return r;
@@ -313,11 +328,30 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
     // 已成功呈现的帧不因尺寸瞬变报错；下帧再重建或等待可用尺寸。
     // Defer suboptimal recreation to the next frame, which can wait for a usable extent.
     if((rebuild||pr==VK_SUBOPTIMAL_KHR)&&surface_properties_changed())swap_dirty=true;
+    // The profiler must run on this synchronous callback, with no frontend/render lock held.
+    render_lock.unlock();
+    if(unsigned request=dm_profile_request.exchange(0)){
+        unsigned kind=request>>16,frames=request&0xffff;
+        int result=kind==2?xbg_game_profile_descriptor_live(frames):kind==3?xbg_game_profile_draw_live(frames):xbg_game_profile_cpu_live(frames);
+        vlog("NVN Android profile request kind=%u frames=%u result=%d",kind,frames,result);
+    }
     return 0;
     }
 }
 }
 extern "C" void dm_android_vk_set_window(ANativeWindow *window){if(window)ANativeWindow_acquire(window);{std::lock_guard<std::mutex> l(window_mutex);if(desired)ANativeWindow_release(desired);desired=window;++generation;}window_cv.notify_all();}
+extern "C" void dm_android_vk_set_background_save_discard(int on){
+    {std::lock_guard<std::mutex> lock(window_mutex);
+     if(on)background_save_state.fetch_or(2,std::memory_order_release);
+     else background_save_state.fetch_and(~2u,std::memory_order_release);}
+    window_cv.notify_all();
+}
+extern "C" void dm_android_vk_set_background(int on){
+    {std::lock_guard<std::mutex> lock(window_mutex);
+     if(on)background_save_state.fetch_or(1,std::memory_order_release);
+     else background_save_state.fetch_and(~1u,std::memory_order_release);}
+    window_cv.notify_all();   // predicate updates share the condition mutex: no missed Surface wakeup
+}
 extern "C" int dm_android_vk_has_window(){return has_window(nullptr);}
 extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t bytes){
     if(path){std::string dir=path;size_t cut=dir.find_last_of('/');if(FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-present-native").c_str(),"rb")){present_native=fgetc(m)!='0';fclose(m);}

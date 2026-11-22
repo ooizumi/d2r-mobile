@@ -379,9 +379,24 @@ void dm_ohos_touch_event(int phase, int id, float x, float y) {
     finish_touch(id, phase == 2 ? "ended" : "cancelled");
     if (_pendEnd != id) t->live = 0;
 }
+void dm_ohos_touch_release(void) {
+    if (!g_ready) return;
+    for (int i = 0; i < 32; i++) g_t[i].live = 0;
+    _nswallow = 0; _uiFinger = NOT; _uiFeDrag = 0;
+    cancel_controls();
+}
+void dm_ohos_touch_back(void) {
+    // MINUS is the map shortcut in the field; menu cancellation is the original game's B action.
+    // Read the same published scene mode as the touch controls, never the live guest UI tree.
+    int in_ui = atomic_load(&g_touch_frontend) || atomic_load(&g_touch_navigation);
+    dm_ohos_touch_release();
+    if (!in_ui && dm_ui_map_is_full()) { dm_ui_map_full(0); return; }
+    dm_ui_key_pulse(in_ui ? DM_BTN_B : DM_BTN_MINUS, 4);
+    LOG("system back: %s", in_ui ? "game cancel (B)" : "field map (MINUS)");
+}
 void dm_ohos_touch_focus(int active) {
     atomic_store(&g_focused, !!active);
-    if (!active && g_ready) { for (int i = 0; i < 32; i++) g_t[i].live = 0; _nswallow = 0; _uiFinger = NOT; _uiFeDrag = 0; cancel_controls(); }
+    if (!active) dm_ohos_touch_release();
 }
 
 // ---- 每帧（tickTouchControls + refreshPortalBinding）| Every frame (tickTouchControls + refreshPortalBinding) ----

@@ -1,0 +1,9 @@
+{
+  "default_quota_bytes": 2147483648,
+  "accounts": [
+    {
+      "id": "android-primary",
+      "token_sha256": "REPLACE_WITH_LOWERCASE_SHA256_HEX"
+    }
+  ]
+}

@@ -5,6 +5,7 @@
 // (vertex / fragment / texture / bandwidth) with the GPU clock, and CPU load. A background thread queries every 2 s, writes one perf-file line
 // (prefix GP) every 10 s and logs it; dm_thermal_now() now returns the system thermal level (the 「温控」 column of the perf summary).
 // Loaded at run time with dlopen: skipped entirely when the device / system lacks it, never blocking startup. DM_GAMEPERF=0 disables.
+#include <stdbool.h>
 #include <GameServiceKit/game_performance.h>
 #include <dlfcn.h>
 #include <pthread.h>

@@ -18,17 +18,46 @@
 #include "../host/hle.h"
 #include <android/log.h>
 #include <android/native_window_jni.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <jni.h>
+#include <stdlib.h>
+#include <stdatomic.h>
+#include <strings.h>
+#include <vulkan/vulkan.h>
 #include "vulkan_present.h"
 #include "touch_android.h"
 #include "front_android.h"
 #include "lifecycle_dispatch.h"
 #include "overlay_validate.h"
 #include "dm_overlay_contract.h"
+#include "../gfx/vulkan/engine/xbg_game.h"
+#include "../gfx/vulkan/engine/xbg_game_internal.h"
+#include "../gfx/vulkan/engine/xbg_visual_options.h"
+#include "../host/dm_scene_resolution.h"
 #include <sys/stat.h>
 #include <unistd.h>
+
+int dm_fs_cloud_snapshot(const char *root, const char *target);
+int dm_fs_cloud_install(const char *root, const char *target);
+static _Atomic int g_cloud_started;
+static jint cloud_files(JNIEnv *env, jstring root, jstring target, int install) {
+    if (!root || !target) return -EINVAL;
+    if (install && atomic_load(&g_cloud_started)) return -EBUSY;
+    const char *r = (*env)->GetStringUTFChars(env, root, NULL);
+    if (!r) return -ENOMEM;
+    const char *t = (*env)->GetStringUTFChars(env, target, NULL);
+    int rc = t ? (install ? dm_fs_cloud_install(r, t) : dm_fs_cloud_snapshot(r, t)) : -ENOMEM;
+    if (t) (*env)->ReleaseStringUTFChars(env, target, t);
+    (*env)->ReleaseStringUTFChars(env, root, r); return rc;
+}
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_CloudSave_nativeSnapshot(JNIEnv *env, jclass cls, jstring root, jstring target) {
+    (void)cls; return cloud_files(env, root, target, 0);
+}
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_CloudSave_nativeInstall(JNIEnv *env, jclass cls, jstring root, jstring target) {
+    (void)cls; return cloud_files(env, root, target, 1);
+}
 
 // 手柄 / 触屏布局与键帽切换（dm_padmode.c 里定义、没有头文件；iOS 由 front_ios.m 直接调）
 // Controller / touch layout and key-cap switching (defined in dm_padmode.c without a header; iOS calls it from front_ios.m)
@@ -40,9 +69,44 @@ void front_android_set_refresh(float hz);
 int dm_main(int argc, char **argv);
 void front_android_boot_failed(int code);
 void dm_sharelog_init(void (*cb)(void));   // dm/host/diag.c
+int dm_save_wait(double max_s, uint64_t *commits, int *froze, double *ms);
 
 static char g_files[1024], g_ext[1024], g_src[1024], g_runtime[1100];
 static FILE *g_logf;
+
+JNIEXPORT jlong JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativePresentedFrames(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    xbg_game_stats stats; xbg_game_get_stats(&stats);
+    return (jlong)stats.presents;
+}
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeRequestProfile(JNIEnv *env, jclass cls, jint kind, jint frames) {
+    (void)env; (void)cls;
+    return dm_android_vk_request_profile(kind, frames);
+}
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetSceneHeight(JNIEnv *env, jclass cls, jint height) {
+    (void)env; (void)cls;
+    return dm_scene_resolution_request(height);
+}
+JNIEXPORT jdoubleArray JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeReadDebugState(JNIEnv *env, jclass cls) {
+    (void)cls;
+    extern double xbg_recent_gpu_ms(void);
+    dm_scene_resolution_state res; dm_scene_resolution_read(&res);
+    xbg_game_stats stats; xbg_game_get_stats(&stats);
+    xbg_frame_counters counters; xbg_game_frame_counters(&counters);
+    xbg_visual_state visual; xbg_game_get_visual_options(&visual);
+    jdouble values[14] = {res.requested_height, res.scene_width, res.scene_height,
+        res.output_width, res.output_height, xbg_recent_gpu_ms(),
+        (double)stats.presents, (double)counters.pipelines, counters.pipeline_ns / 1e6,
+        (double)stats.draws, visual.requested, visual.applied,
+        (double)visual.bloom_draws_skipped, (double)visual.pixel_upscale_draws};
+    jdoubleArray result = (*env)->NewDoubleArray(env, 14);
+    if (result) (*env)->SetDoubleArrayRegion(env, result, 0, 14, values);
+    return result;
+}
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetRenderOptions(JNIEnv *env, jclass cls, jint flags) {
+    (void)env; (void)cls;
+    return xbg_game_set_visual_options(flags);
+}
 
 #ifdef DM_ANDROID_DEBUG_ENV
 #include "debug_env.h"
@@ -61,21 +125,53 @@ static void debug_environment(void) {
 
 // 挂起只能在原生pthread栈上执行；UI只登记最新状态，不能等正在等待Surface的呈现调用。
 // Suspend only on a native pthread stack; UI posts latest state without waiting for a present that needs a Surface.
-static dm_lifecycle_dispatch g_lifecycle;
+static dm_lifecycle_dispatch g_lifecycle = DM_LIFECYCLE_DISPATCH_INIT;
 static pthread_once_t g_lifecycle_once = PTHREAD_ONCE_INIT;
 static int g_lifecycle_error;
+static void lifecycle_background_save(int enabled) {
+    if (!enabled) {
+        LOG("background autosave skipped reason=disabled");
+        return;
+    }
+    if (!dm_ingame_now()) {
+        LOG("background autosave skipped reason=not_ingame");
+        return;
+    }
+    uint64_t commits = 0;
+    int froze = 0;
+    double duration_ms = 0;
+    dm_android_vk_set_background_save_discard(1);
+    int requested = dm_save_wait(2.5, &commits, &froze, &duration_ms);
+    dm_android_vk_set_background_save_discard(0);
+    int timeout = commits == 0;
+    LOG("background autosave requested=%d commits=%llu froze=%d duration_ms=%.0f timeout=%d success=%d",
+        requested, (unsigned long long)commits, froze, duration_ms, timeout, commits != 0);
+}
 static void lifecycle_graphics(int on) {
-    __android_log_print(ANDROID_LOG_INFO, "dm-lifecycle", "graphics suspend=%d begin", on);
+    if (on) {
+        // Wait only on the lifecycle worker, never on the UI or render thread.
+        // Portable pipeline records are independent of the driver's cache.
+        xbg_game_request_pipeline_list_save();
+        int saved = xbg_game_wait_pipeline_list_save(250);
+        LOG("pipeline list background flush complete=%d", saved);
+    }
+    LOG("graphics suspend=%d begin", on);
     dm_gfx_suspend(on);
-    __android_log_print(ANDROID_LOG_INFO, "dm-lifecycle", "graphics suspend=%d complete", on);
+    LOG("graphics suspend=%d complete", on);
 }
 static void lifecycle_init(void) {
-    dm_lifecycle_ops ops = {dm_focus_set, dm_audio_suspend, lifecycle_graphics};
+    dm_lifecycle_ops ops = {dm_focus_set, dm_audio_suspend, lifecycle_graphics, lifecycle_background_save};
     g_lifecycle_error = dm_lifecycle_start(&g_lifecycle, ops);
     if (!g_lifecycle_error) pthread_setname_np(g_lifecycle.thread, "dm-lifecycle");
-    if (g_lifecycle_error) __android_log_print(ANDROID_LOG_ERROR, "dm-lifecycle", "worker start failed rc=%d", g_lifecycle_error);
+    if (g_lifecycle_error) LOG("lifecycle worker start failed rc=%d", g_lifecycle_error);
 }
 static int lifecycle_ready(void) { pthread_once(&g_lifecycle_once, lifecycle_init); return !g_lifecycle_error; }
+
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetBackgroundAutosave(JNIEnv *env, jclass cls, jboolean enabled) {
+    (void)env; (void)cls;
+    dm_lifecycle_set_background_autosave(&g_lifecycle, enabled ? 1 : 0);
+    LOG("background autosave configured enabled=%d", enabled ? 1 : 0);
+}
 
 // stderr → 管道 → 本线程：逐行写日志文件（adb pull 取）并转 logcat（标签 dm）
 // stderr → pipe → this thread: write line by line to the log file (fetched with adb pull) and forward to logcat (tag dm)
@@ -155,15 +251,17 @@ static void load_env_file(const char *dir) {
 
 // 走覆盖层的自定义开关（物品注释与旧译名，#191）：打包时 gen_romfs_overlay.py 在 overlay 旁边出了各开关组合的完整覆盖层
 // overlay_variants/<键+键…>（d2rm_android.py 带进导入包）。照 iOS main.m：挑键集合与开着的开关正好相等的那份，核过它自己的清单，
-// 写成「变体:overlay」返回 1——DM_ROMFS_OVERLAY 可以有多层、前面优先：游戏数据用变体那份，触屏素材只在 overlay 里、照常找到。
-// 全关、没有变体目录、没有对应组合或清单不对：返回 0，用 overlay。重启后生效（同 iOS）
+// 返回命中的变体路径；调用者再把它和完整 overlay 叠层，触屏素材始终保留。全关返回 0；开关开着但组合/清单不对返回 -1。
+// Return the selected variant path, which the caller layers over the complete overlay so touch art is always retained. Return 0
+// when all switches are off and -1 when switches are enabled but the matching variant or its manifest is invalid.
 // Custom switches that go through the overlay (item notes and old translated names, #191): at pack time gen_romfs_overlay.py writes a complete overlay per
 // switch combination next to overlay, overlay_variants/<key+key...> (d2rm_android.py puts it in the import pack). As in iOS main.m: pick the one whose key
-// set equals the switches that are on, check its own manifest, write "variant:overlay" and return 1 -- DM_ROMFS_OVERLAY may have layers, earlier first: the
-// game data comes from the variant, the touch art exists only in overlay and is found as usual. Everything off, no variants directory, no matching
-// combination or a bad manifest: return 0 and use overlay. Takes effect after a restart (as on iOS)
+// set equals the switches that are on and validate its own manifest. The caller layers the result over the complete overlay, so game data comes
+// from the variant while touch art still comes from the base. Everything off returns 0; an enabled but missing/invalid combination returns -1.
 int dm_custom_get(const char *key); void dm_custom_init(const char *dir);
+// 0/1 = base directory / exact enabled combination; -1 = switches are on but no valid matching combination exists.
 static int overlay_variant(const char *overlay, char *out, size_t n) {
+    if (snprintf(out, n, "%s", overlay) >= (int)n) return -1;
     char vdir[1300]; snprintf(vdir, sizeof vdir, "%s_variants", overlay);
     DIR *d = opendir(vdir); if (!d) return 0;
     char names[16][64]; int nv = 0; struct dirent *e;
@@ -181,17 +279,108 @@ static int overlay_variant(const char *overlay, char *out, size_t n) {
         for (char *k = strtok_r(t, "+", &sp); k; k = strtok_r(NULL, "+", &sp)) {
             int seen = 0; for (int j = 0; j < nk; j++) seen |= !strcmp(keys[j], k);
             if (!seen && nk < 16) { strlcpy(keys[nk++], k, sizeof keys[0]); on += dm_custom_get(k) != 0; } } }
-    if (!on) { LOG("boot: 覆盖层变体 %d 份，开关都关着，用 overlay", nv); return 0; }
+    if (!on) { LOG("boot: 覆盖层变体 %d 份，开关都关着，用全关覆盖层", nv); return 0; }
     for (int i = 0; i < nv; i++) { char t[64], *sp = NULL; int cnt = 0, all = 1; strlcpy(t, names[i], sizeof t);
         for (char *k = strtok_r(t, "+", &sp); k; k = strtok_r(NULL, "+", &sp)) { cnt++; all &= dm_custom_get(k) != 0; }
         if (!all || cnt != on) continue;
         char path[1400], reason[256]; snprintf(path, sizeof path, "%s/%s", vdir, names[i]);
         dm_overlay_result r = dm_overlay_validate(path, DM_OVERLAY_SOURCE_SHA256, reason, sizeof reason);
-        if (r != DM_OVERLAY_OK) { LOG("boot: 【红】覆盖层变体 %s 不能用（%d：%s），按开关全关启动", names[i], r, reason); return 0; }
-        if (snprintf(out, n, "%s:%s", path, overlay) >= (int)n) return 0;
-        LOG("boot: 覆盖层变体 %s（开关开着，叠在 overlay 前面）", names[i]); return 1; }
-    LOG("boot: 【红】开着的 %d 个覆盖层开关没有对应的变体，按开关全关启动", on);
-    return 0;
+        if (r != DM_OVERLAY_OK) { LOG("boot: 【红】覆盖层变体 %s 不能用（%d：%s）", names[i], r, reason); return -1; }
+        if (snprintf(out, n, "%s", path) >= (int)n) return -1;
+        LOG("boot: 覆盖层变体 %s", names[i]); return 1; }
+    LOG("boot: 【红】开着的 %d 个覆盖层开关没有对应的变体", on);
+    return -1;
+}
+
+typedef struct { char name[128], sha256[65]; unsigned long long size; } astc_pack_info;
+
+static int astc_json_string(const char *json, const char *key, char *out, size_t n) {
+    char needle[64]; if (snprintf(needle, sizeof needle, "\"%s\"", key) >= (int)sizeof needle) return 0;
+    const char *p = strstr(json, needle); if (!p) return 0; p += strlen(needle);
+    while (isspace((unsigned char)*p)) ++p; if (*p++ != ':') return 0; while (isspace((unsigned char)*p)) ++p;
+    if (*p++ != '"') return 0; const char *e = strchr(p, '"'); if (!e || e == p || (size_t)(e - p) >= n) return 0;
+    if (memchr(p, '\\', (size_t)(e - p))) return 0; memcpy(out, p, (size_t)(e - p)); out[e - p] = 0; return 1;
+}
+static int astc_json_size(const char *json, unsigned long long *out) {
+    const char *p = strstr(json, "\"size\""); if (!p) return 0; p += 6;
+    while (isspace((unsigned char)*p)) ++p; if (*p++ != ':') return 0; while (isspace((unsigned char)*p)) ++p;
+    if (!isdigit((unsigned char)*p)) return 0; errno = 0; char *e = NULL; unsigned long long v = strtoull(p, &e, 10);
+    if (errno || e == p || !v) return 0; while (isspace((unsigned char)*e)) ++e; if (*e != ',' && *e != '}') return 0; *out = v; return 1;
+}
+static int astc_archive_name_ok(const char *s) {
+    size_t n = strlen(s); if (n < 6 || n >= 128 || strcmp(s + n - 5, ".data")) return 0;
+    for (size_t i = 0; i < n; ++i) if (!isalnum((unsigned char)s[i]) && s[i] != '_' && s[i] != '-' && s[i] != '.') return 0;
+    return 1;
+}
+static int astc_sha256_ok(const char *s) {
+    if (strlen(s) != 64) return 0; for (int i = 0; i < 64; ++i) if (!isxdigit((unsigned char)s[i])) return 0; return 1;
+}
+static int astc_kv_string(const char *buf, const char *key, char *out, size_t n) {
+    char needle[64]; if (snprintf(needle, sizeof needle, "%s=", key) >= (int)sizeof needle) return 0;
+    const char *p = strstr(buf, needle); if (!p) return 0; p += strlen(needle);
+    const char *e = p; while (*e && *e != '\r' && *e != '\n') ++e; if (e == p || (size_t)(e - p) >= n) return 0;
+    memcpy(out, p, (size_t)(e - p)); out[e - p] = 0; return 1;
+}
+static int astc_kv_ull(const char *buf, const char *key, unsigned long long *out) {
+    char value[32]; if (!astc_kv_string(buf, key, value, sizeof value)) return 0;
+    errno = 0; char *e = NULL; unsigned long long v = strtoull(value, &e, 10); if (errno || e == value || *e) return 0; *out = v; return 1;
+}
+// Validate the selected ASTC overlay plus the exact archive named and hashed by its pack.json.
+// The full digest runs once on Java's import worker; startup only rechecks the resulting archive identity token.
+static int astc_pack_validate(const char *runtime, const char *overlay, char *layers, size_t layer_n,
+                              char *error, size_t error_n) {
+    char marker[1200], astc_root[1300], meta[1300], packroot[1200], manifest[1300], archive[1400], token_path[1300];
+    snprintf(marker, sizeof marker, "%s/gfx-astc-pack", runtime); struct stat ms;
+    if (stat(marker, &ms) || !S_ISREG(ms.st_mode)) return 0;
+    snprintf(astc_root, sizeof astc_root, "%s/overlay_astc", runtime); snprintf(packroot, sizeof packroot, "%s/Legacy Device Pack", runtime);
+    snprintf(meta, sizeof meta, "%s/overlay_astc/pack.json", runtime); snprintf(manifest, sizeof manifest, "%s/manifest.json", packroot);
+    snprintf(token_path, sizeof token_path, "%s/astc-pack.verified", runtime);
+    char why[256]; dm_overlay_result ov = dm_overlay_validate(astc_root, DM_OVERLAY_SOURCE_SHA256, why, sizeof why);
+    if (ov != DM_OVERLAY_OK) { if (error && error_n) snprintf(error, error_n, "base ASTC overlay is missing or invalid (%d: %s)", ov, why); return -1; }
+    if (strcmp(overlay, astc_root)) { ov = dm_overlay_validate(overlay, DM_OVERLAY_SOURCE_SHA256, why, sizeof why);
+        if (ov != DM_OVERLAY_OK) { if (error && error_n) snprintf(error, error_n, "ASTC variant is missing or invalid (%d: %s)", ov, why); return -1; } }
+    if (access(manifest, R_OK)) { if (error && error_n) snprintf(error, error_n, "ASTC marker is on, but %s/manifest.json is missing", packroot); return -1; }
+    FILE *f = fopen(meta, "rb"); if (!f) { if (error && error_n) snprintf(error, error_n, "ASTC pack metadata is missing: %s", meta); return -1; }
+    char json[4097]; size_t got = fread(json, 1, sizeof json - 1, f); int bad = ferror(f); fclose(f); json[got] = 0;
+    astc_pack_info info = {0};
+    if (bad || got == sizeof json - 1 || !astc_json_string(json, "name", info.name, sizeof info.name) || !astc_json_size(json, &info.size) ||
+        !astc_json_string(json, "sha256", info.sha256, sizeof info.sha256) || !astc_archive_name_ok(info.name) || !astc_sha256_ok(info.sha256)) {
+        if (error && error_n) snprintf(error, error_n, "ASTC pack metadata is invalid: %s", meta); return -1;
+    }
+    f = fopen(token_path, "rb"); if (!f) { if (error && error_n) snprintf(error, error_n, "ASTC import validation token is missing"); return -1; }
+    char token[4097]; got = fread(token, 1, sizeof token - 1, f); bad = ferror(f); fclose(f); token[got] = 0;
+    char token_sha[65]; unsigned long long token_size = 0, mtime_sec = 0, mtime_nsec = 0, inode = 0;
+    if (bad || got == sizeof token - 1 || !astc_kv_string(token, "sha256", token_sha, sizeof token_sha) || !astc_sha256_ok(token_sha) ||
+        !astc_kv_ull(token, "size", &token_size) || !astc_kv_ull(token, "mtime_sec", &mtime_sec) || !astc_kv_ull(token, "mtime_nsec", &mtime_nsec) ||
+        !astc_kv_ull(token, "inode", &inode) || strcasecmp(token_sha, info.sha256) || token_size != info.size) {
+        if (error && error_n) snprintf(error, error_n, "ASTC import validation token is invalid or does not match pack.json"); return -1;
+    }
+    snprintf(archive, sizeof archive, "%s/data/%s", packroot, info.name); struct stat st;
+    if (stat(archive, &st) || !S_ISREG(st.st_mode) || st.st_size < 0 || (unsigned long long)st.st_size != token_size ||
+        (unsigned long long)st.st_mtim.tv_sec != mtime_sec || (unsigned long long)st.st_mtim.tv_nsec != mtime_nsec || (unsigned long long)st.st_ino != inode) {
+        if (error && error_n) snprintf(error, error_n, "ASTC archive is missing or has the wrong size: %s", archive); return -1;
+    }
+    if (snprintf(layers, layer_n, "%s:%s", overlay, packroot) >= (int)layer_n) { if (error && error_n) snprintf(error, error_n, "ASTC overlay path is too long"); return -1; }
+    LOG("boot: ASTC 补充包身份校验通过 archive=%s bytes=%llu sha256=%s", archive, info.size, token_sha); return 1;
+}
+
+static int astc_device_supported(void) {
+    VkApplicationInfo app = {0}; app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO; app.pApplicationName = "dm-astc-probe"; app.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ci = {0}; ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO; ci.pApplicationInfo = &app;
+    VkInstance instance = VK_NULL_HANDLE; VkResult r = vkCreateInstance(&ci, NULL, &instance);
+    if (r != VK_SUCCESS) { LOG("boot: ASTC probe vkCreateInstance=%d", (int)r); return 0; }
+    uint32_t count = 0; r = vkEnumeratePhysicalDevices(instance, &count, NULL);
+    if (r != VK_SUCCESS || !count) { LOG("boot: ASTC probe devices=%u result=%d", count, (int)r); vkDestroyInstance(instance, NULL); return 0; }
+    VkPhysicalDevice *devices = calloc(count, sizeof *devices);
+    if (!devices) { vkDestroyInstance(instance, NULL); return 0; }
+    r = vkEnumeratePhysicalDevices(instance, &count, devices);
+    VkPhysicalDeviceFeatures f = {0}; if (r == VK_SUCCESS && count) vkGetPhysicalDeviceFeatures(devices[0], &f);
+    int ok = r == VK_SUCCESS && count && f.textureCompressionASTC_LDR;
+    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    for (int i = 0; ok && i < 2; ++i) { VkFormatProperties p = {0}; vkGetPhysicalDeviceFormatProperties(devices[0], i ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK : VK_FORMAT_ASTC_4x4_UNORM_BLOCK, &p); ok = (p.optimalTilingFeatures & need) == need; }
+    if (count) { VkPhysicalDeviceProperties p = {0}; vkGetPhysicalDeviceProperties(devices[0], &p); LOG("boot: ASTC capability device=\"%s\" astcLdr=%u linear4x4=%d", p.deviceName, (unsigned)f.textureCompressionASTC_LDR, ok); }
+    free(devices); vkDestroyInstance(instance, NULL); return ok;
 }
 
 // 暂停菜单「分享诊断日志」（#216）：按钮发 PanelManager:ClosePanel:TouchShareLog，宿主（dm/host/diag.c）在游戏主线程调这里；交给 Java 打文件、弹分享面板
@@ -364,11 +553,31 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
         return overlay == DM_OVERLAY_MISSING ? -9 : -10;
     }
     LOG("boot: overlay verified source=%s", DM_OVERLAY_SOURCE_SHA256);
-    char layered[2800];
-    setenv("DM_ROMFS_OVERLAY", overlay_variant(required, layered, sizeof layered) ? layered : required, 1);
+    char base_overlay[1400], base_layers[2800]; int base_variant = overlay_variant(required, base_overlay, sizeof base_overlay);
+    if (base_variant == 1) snprintf(base_layers, sizeof base_layers, "%s:%s", base_overlay, required);
+    else snprintf(base_layers, sizeof base_layers, "%s", required);
+    char astc_root[1300], astc_overlay[1400], astc_layers[2800], layered[5800], astc_marker[1200];
+    snprintf(astc_root, sizeof astc_root, "%s/overlay_astc", g_runtime);
+    snprintf(astc_marker, sizeof astc_marker, "%s/gfx-astc-pack", g_runtime); struct stat astc_marker_st;
+    if (!stat(astc_marker, &astc_marker_st) && S_ISREG(astc_marker_st.st_mode)) {
+        if (!astc_device_supported()) { LOG("boot: 【红】ASTC marker is enabled, but this Vulkan device cannot sample linearly filterable ASTC 4x4"); return -12; }
+        int astc_variant = overlay_variant(astc_root, astc_overlay, sizeof astc_overlay); char why[512] = "";
+        if (base_variant < 0 || astc_variant < 0 || (base_variant == 1) != (astc_variant == 1)) {
+            LOG("boot: 【红】ASTC 覆盖层与基础覆盖层的开关组合不一致：base=%d astc=%d", base_variant, astc_variant); return -11;
+        }
+        int astc_ok = astc_pack_validate(g_runtime, astc_overlay, astc_layers, sizeof astc_layers, why, sizeof why);
+        if (astc_ok < 0) { LOG("boot: 【红】ASTC 补充包不可用：%s", why); return -11; }
+        if (snprintf(layered, sizeof layered, "%s:%s", astc_layers, base_layers) >= (int)sizeof layered) {
+            LOG("boot: 【红】ASTC 覆盖层路径过长"); return -11;
+        }
+        LOG("boot: ASTC 覆盖层 %s:%s", layered, "保留基础触屏素材");
+    } else snprintf(layered, sizeof layered, "%s", base_layers);
+    setenv("DM_ROMFS_OVERLAY", layered, 1);
     if (!lifecycle_ready()) return -8;
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8u << 20);
+    atomic_store(&g_cloud_started, 1);
     pthread_t th; int rc = pthread_create(&th, &a, host_thread, NULL); pthread_attr_destroy(&a);
+    if (rc) atomic_store(&g_cloud_started, 0);
     if (!rc) { started = 1; pthread_detach(th); }
     return rc ? -1 : n;
 }
@@ -469,9 +678,12 @@ JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativePadGlyph(JNIEnv *
 // UI posts only: 0 unfocused, 1 background, 2 foreground, 3 active; active also declares foreground so merging 2/3 cannot lose resume.
 JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeFocus(JNIEnv *env, jclass cls, jint ev) {
     (void)env; (void)cls;
+    if (ev == 1) dm_android_vk_set_background(1);
+    else if (ev == 2 || ev == 3) dm_android_vk_set_background(0);
+    if (ev == 0 || ev == 1) xbg_game_request_pipeline_list_save();
     dm_android_touch_focus(ev == 2 || ev == 3);
     if (lifecycle_ready()) {
         dm_lifecycle_post(&g_lifecycle, ev);
-        __android_log_print(ANDROID_LOG_INFO, "dm-lifecycle", "UI posted event=%d", ev);
+        LOG("lifecycle UI posted event=%d", ev);
     }
 }

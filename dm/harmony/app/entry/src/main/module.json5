@@ -7,9 +7,12 @@
     "type": "entry",
     "description": "$string:module_desc",
     "mainElement": "EntryAbility",
-    "deviceTypes": ["phone"],
+    "deviceTypes": ["phone", "tablet"],
     "deliveryWithInstall": true,
     "installationFree": false,
+    "requestPermissions": [
+      { "name": "ohos.permission.INTERNET" }
+    ],
     "pages": "$profile:main_pages",
     "abilities": [{
       "name": "EntryAbility",

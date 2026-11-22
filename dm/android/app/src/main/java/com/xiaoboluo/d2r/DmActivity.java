@@ -9,11 +9,13 @@ import android.app.AlertDialog;
 import android.content.Intent;
 import android.net.Uri;
 import android.hardware.display.DisplayManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.Settings;
 import android.system.ErrnoException;
 import android.system.Os;
+import android.system.StructStat;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.SpanWatcher;
@@ -42,6 +44,7 @@ import java.io.OutputStream;
 import java.lang.ref.WeakReference;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.security.MessageDigest;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -50,6 +53,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import org.json.JSONObject;
 
 public class DmActivity extends Activity implements SurfaceHolder.Callback, DisplayManager.DisplayListener {
     static native int nativeStart(String filesDir, String extDir, String romfsSrc, String lang);
@@ -57,6 +61,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static native void nativeRefresh(float hz);
     static native void nativeTouch(int n, int[] ids, float[] xs, float[] ys);
     static native void nativeFocus(int ev);
+    static native void nativeSetBackgroundAutosave(boolean enabled);
     static native void nativeTextResult(long id, boolean accepted, String text);
     // 越肩镜头的体感转向（CamSensor）：开哪种传感器（0 = 不开），每次转动的弧度
     // Sensor steering of the over-the-shoulder camera (CamSensor): which sensor to listen to (0 = none), each turn in radians
@@ -81,14 +86,28 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static native void nativePad(long buttons, int lx, int ly, int rx, int ry);
     static native void nativePadMode(int pad);
     static native void nativePadGlyph(int glyph);
+    static native long nativePresentedFrames();
+    static native int nativeRequestProfile(int kind, int frames);
+    static native int nativeSetSceneHeight(int height);
+    static native int nativeSetRenderOptions(int flags);
+    static native double[] nativeReadDebugState();
 
     private static WeakReference<DmActivity> current = new WeakReference<>(null);
     private static volatile int bootFailure;
     private AlertDialog inputDialog;
+    private static final String RUNTIME_PREFS = "runtime_settings";
+    private static final String BACKGROUND_AUTOSAVE = "background_autosave";
+    private static final String SCENE_HEIGHT = "scene_height";
+    private static final String RENDER_OPTIONS = "render_options";
+    private static final int DEFAULT_SCENE_HEIGHT = 540;
+    static final int RENDER_OPTION_DISABLE_BLOOM = 1;
+    static final int RENDER_OPTION_PIXEL_SCENE = 2;
+    private static final int RENDER_OPTION_VALID_MASK = RENDER_OPTION_DISABLE_BLOOM | RENDER_OPTION_PIXEL_SCENE;
 
     private SurfaceView view;
     private FrameLayout gameFrame;
     private TouchOverlay touchOverlay;
+    private PerformanceOverlay performanceOverlay;
     private boolean started;
     private boolean importing, savesTransferred;
     private boolean libraryLoaded;
@@ -98,6 +117,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     private CamSensor camSensor;
     private CamButtons camButtons;
     private CamThreats camThreats;
+    private CloudSave cloudSave;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -118,12 +138,119 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         gameFrame = new FrameLayout(this);
         gameFrame.addView(view, new FrameLayout.LayoutParams(-1, -1));
         setContentView(gameFrame);
+        cloudSave = new CloudSave(this, getFilesDir());
         immersive();
     }
 
     private void immersive() {
         WindowInsetsController c = getWindow().getInsetsController();
         if (c != null) { c.hide(WindowInsets.Type.systemBars()); c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE); }
+    }
+
+    boolean backgroundAutosaveEnabled() {
+        return getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).getBoolean(BACKGROUND_AUTOSAVE, true);
+    }
+
+    private static boolean supportedSceneHeight(int height) {
+        return height == 360 || height == 432 || height == 480 || height == 540 || height == 600 || height == 720 || height == 900 || height == 1080;
+    }
+
+    int debugSceneHeight() {
+        int height = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).getInt(SCENE_HEIGHT, DEFAULT_SCENE_HEIGHT);
+        return supportedSceneHeight(height) ? height : DEFAULT_SCENE_HEIGHT;
+    }
+
+    int debugRenderOptions() {
+        return getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).getInt(RENDER_OPTIONS, 0) & RENDER_OPTION_VALID_MASK;
+    }
+
+    boolean debugBloomEnabled() {
+        return (debugRenderOptions() & RENDER_OPTION_DISABLE_BLOOM) == 0;
+    }
+
+    boolean debugPixelSceneEnabled() {
+        return (debugRenderOptions() & RENDER_OPTION_PIXEL_SCENE) != 0;
+    }
+
+    int applyDebugRenderOption(int option, boolean enabled) {
+        if (option != RENDER_OPTION_DISABLE_BLOOM && option != RENDER_OPTION_PIXEL_SCENE) return -1;
+        int flags = debugRenderOptions();
+        flags = enabled ? flags | option : flags & ~option;
+        return commitRenderOptions(flags & RENDER_OPTION_VALID_MASK);
+    }
+
+    int applyDebugSceneHeight(int height) {
+        if (!libraryLoaded || !supportedSceneHeight(height)) return -1;
+        try {
+            int result = nativeSetSceneHeight(height);
+            if (result == 0) getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit().putInt(SCENE_HEIGHT, height).apply();
+            return result;
+        } catch (UnsatisfiedLinkError error) {
+            android.util.Log.e("dm", "scene height setter unavailable", error);
+            return -1;
+        }
+    }
+
+    void applyBackgroundAutosave(boolean enabled) {
+        getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit().putBoolean(BACKGROUND_AUTOSAVE, enabled).apply();
+        if (libraryLoaded) nativeSetBackgroundAutosave(enabled);
+    }
+
+    double[] readDebugState() {
+        try { return nativeReadDebugState(); }
+        catch (UnsatisfiedLinkError error) { return null; }
+    }
+
+    int requestDebugProfile(int kind, int frames) {
+        if (!BuildConfig.DEBUG || !started) return -1;
+        return nativeRequestProfile(kind, frames);
+    }
+
+    private void applySavedSceneHeight() {
+        try {
+            int result = nativeSetSceneHeight(debugSceneHeight());
+            if (result != 0) android.util.Log.w("dm", "scene height rejected before start: " + debugSceneHeight() + " result=" + result);
+        } catch (UnsatisfiedLinkError error) {
+            android.util.Log.e("dm", "scene height setter unavailable before start", error);
+        }
+    }
+
+    private int commitRenderOptions(int flags) {
+        if (!libraryLoaded) return -1;
+        try {
+            int result = nativeSetRenderOptions(flags);
+            if (result == 0) getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit().putInt(RENDER_OPTIONS, flags).apply();
+            return result;
+        } catch (UnsatisfiedLinkError error) {
+            android.util.Log.e("dm", "render option setter unavailable", error);
+            return -1;
+        }
+    }
+
+    private void applySavedRenderOptions() {
+        int flags = debugRenderOptions();
+        try {
+            int result = nativeSetRenderOptions(flags);
+            if (result != 0) android.util.Log.w("dm", "render options rejected before start: " + flags + " result=" + result);
+        } catch (UnsatisfiedLinkError error) {
+            android.util.Log.e("dm", "render option setter unavailable before start", error);
+        }
+    }
+
+    private void showDebugMenu() {
+        if (!BuildConfig.DEBUG || !libraryLoaded || !started || isFinishing() || isDestroyed()) return;
+        releaseTouches();
+        GameDebugMenu.show(this, this::releaseTouches, this::immersive);
+    }
+
+    // Debug-only live profiling requests are consumed on the native present thread.
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        if (BuildConfig.DEBUG && libraryLoaded && intent.hasExtra("dmProfile")) {
+            int kind = intent.getIntExtra("dmProfile", 0), frames = intent.getIntExtra("dmProfileFrames", 60);
+            int result = nativeRequestProfile(kind, frames);
+            android.util.Log.i("dm", "Profile request kind=" + kind + " frames=" + frames + " queued=" + result);
+        }
     }
 
     // 实体手柄：按键与摇杆在 PadInput 里合成宿主的手柄状态（nativePad → dm_pad_set），与触屏的虚拟手柄在游戏取手柄时合并。
@@ -205,7 +332,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     // 旧导入包没有它，照常导入；新导入包没有它时，旧的那份删掉
     // Optional import items: the overlays for custom switches that go through the overlay (item notes and old names, #191; jni_android.c picks one at start).
     // Older import packs lack it and still import; when a new import pack lacks it, the old copy is removed
-    private static final String[] OPTIONAL_ITEMS = {"overlay_variants"};
+    private static final String[] OPTIONAL_ITEMS = {"overlay_variants", "overlay_astc", "overlay_astc_variants", "Legacy Device Pack", "gfx-astc-pack", "astc-pack.verified"};
 
     private static String readText(File f) {
         try { return new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8); } catch (IOException e) { return null; }
@@ -222,7 +349,11 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (importing) return false;
         File runtime = new File(getFilesDir(), "dm");
         String want = readText(new File(source, "pack_info.txt")), have = readText(new File(runtime, "pack_info.txt"));
-        if (want != null && !want.equals(have)) {
+        boolean interrupted = new File(runtime, "import.incomplete").isFile();
+        if (interrupted && want == null) { showStartError("上次导入未完成，且找不到可重试的导入包。请恢复原导入包后重新启动。"); return false; }
+        boolean sourceAstc = new File(source, "gfx-astc-pack").isFile(), runtimeAstc = new File(runtime, "gfx-astc-pack").isFile();
+        boolean astcNeedsImport = sourceAstc != runtimeAstc || (sourceAstc && !new File(runtime, "astc-pack.verified").isFile());
+        if (want != null && (interrupted || !want.equals(have) || astcNeedsImport)) {
             String product = packProduct(want);
             if (!BuildConfig.DM_PRODUCT.equals(product)) { showStartError(getString(R.string.dmAndroidImportVersion, product)); return false; }
             importing = true;
@@ -252,10 +383,52 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
 
     private interface Progress { void percent(int p); }
 
+    private static String fileSha256(File f) throws IOException {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            try (InputStream in = new FileInputStream(f)) {
+                byte[] buffer = new byte[1 << 20];
+                for (int n; (n = in.read(buffer)) > 0; ) md.update(buffer, 0, n);
+            }
+            StringBuilder out = new StringBuilder(64);
+            for (byte b : md.digest()) out.append(String.format(Locale.ROOT, "%02x", b & 0xff));
+            return out.toString();
+        } catch (Exception e) { throw new IOException("SHA-256: " + e.getMessage(), e); }
+    }
+
+    // Runs on the existing import worker thread. The full archive hash happens once here; native startup only checks
+    // that the same archive identity (size/mtime/inode) and expected digest still match this token.
+    private static void validateAstcPack(File part) throws IOException {
+        try {
+            JSONObject info = new JSONObject(new String(Files.readAllBytes(new File(part, "overlay_astc/pack.json").toPath()), StandardCharsets.UTF_8));
+            String name = info.getString("name"), expected = info.getString("sha256").toLowerCase(Locale.ROOT); long size = info.getLong("size");
+            if (!name.equals("00-00000008.data") || expected.length() != 64 || size <= 0) throw new IOException("invalid ASTC pack.json");
+            File archive = new File(part, "Legacy Device Pack/data/" + name);
+            if (!archive.isFile() || archive.length() != size) throw new IOException("ASTC archive missing or wrong size");
+            String actual = fileSha256(archive);
+            if (!actual.equals(expected)) throw new IOException("ASTC archive SHA-256 mismatch");
+            StructStat st = Os.stat(archive.getAbsolutePath());
+            String token = "DM_ASTC_V2\nsha256=" + expected + "\nsize=" + size + "\nmtime_sec=" + st.st_mtim.tv_sec +
+                    "\nmtime_nsec=" + st.st_mtim.tv_nsec + "\ninode=" + st.st_ino + "\n";
+            Files.write(new File(part, "astc-pack.verified").toPath(), token.getBytes(StandardCharsets.US_ASCII));
+        } catch (IOException e) { throw e; }
+        catch (Exception e) { throw new IOException("ASTC validation: " + e.getMessage(), e); }
+    }
+
     private static void importPack(File source, File runtime, Progress progress) throws IOException {
         for (String item : IMPORT_ITEMS) if (!new File(source, item).exists()) throw new IOException("missing " + item);
-        List<String> items = new ArrayList<>(Arrays.asList(IMPORT_ITEMS));
-        for (String item : OPTIONAL_ITEMS) if (new File(source, item).exists()) items.add(item);
+        File astcMarker = new File(source, "gfx-astc-pack");
+        if (astcMarker.exists()) {
+            if (!astcMarker.isFile()) throw new IOException("gfx-astc-pack is not a file");
+            for (String item : new String[]{"overlay_astc", "Legacy Device Pack"})
+                if (!new File(source, item).isDirectory()) throw new IOException("ASTC marker requires " + item);
+            File archive = new File(source, "Legacy Device Pack/data/00-00000008.data");
+            if (!archive.isFile()) throw new IOException("ASTC marker requires Legacy Device Pack/data/00-00000008.data");
+        }
+        List<String> items = new ArrayList<>();
+        for (String item : IMPORT_ITEMS) if (!item.equals("pack_info.txt")) items.add(item);
+        for (String item : OPTIONAL_ITEMS) if (!item.equals("astc-pack.verified") && new File(source, item).exists()) items.add(item);
+        items.add("pack_info.txt");
         File part = new File(runtime, "import.part");
         deleteTree(part);
         long sum = 0;
@@ -268,13 +441,17 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             int p = (int) (done[0] * 100 / Math.max(1, total));
             if (p != shown[0]) { shown[0] = p; progress.percent(p); }
         });
+        if (astcMarker.exists()) { validateAstcPack(part); items.add(items.size() - 1, "astc-pack.verified"); }
+        File interrupted = new File(runtime, "import.incomplete");
+        Files.write(interrupted.toPath(), new byte[0]);
+        for (String item : OPTIONAL_ITEMS) if (!items.contains(item)) deleteTree(new File(runtime, item));
         for (String item : items) {
             File from = new File(part, item), to = new File(runtime, item);
             deleteTree(to);
             if (!from.renameTo(to)) throw new IOException("rename " + item);
         }
-        for (String item : OPTIONAL_ITEMS) if (!items.contains(item)) deleteTree(new File(runtime, item));
         deleteTree(part);
+        Files.deleteIfExists(interrupted.toPath());
     }
 
     private interface Copied { void bytes(long n); }
@@ -345,6 +522,13 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             try { Os.setenv("DM_DERIVED", new File(runtime, "derived.tsv").getAbsolutePath(), true); } catch (ErrnoException e) { showStartError(getString(R.string.dmAndroidStorage)); return; }
             try { System.loadLibrary("dm"); libraryLoaded = true; }
             catch (UnsatisfiedLinkError error) { showStartError(getString(R.string.dmAndroidLibrary)); return; }
+            applySavedSceneHeight();
+            nativeSetBackgroundAutosave(backgroundAutosaveEnabled());
+            applySavedRenderOptions();
+        }
+        if (cloudSave != null && !cloudSave.isLaunchReady()) {
+            cloudSave.start(this::startHost);
+            return;
         }
         if (touchOverlay == null) {
             int[] gameIds = {R.string.dmAndroidAttack, R.string.dmAndroidSkill1, R.string.dmAndroidSkill2, R.string.dmAndroidSkill3, R.string.dmAndroidSkill4,
@@ -363,6 +547,23 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             if (BuildConfig.DEBUG && getIntent().getBooleanExtra("dmNoHud", false)) touchOverlay.setDebugNoHud(true);   // 调试包：量游戏自己的 HUD 时不画自绘层 | debug builds: no overlay drawing while measuring the game's own HUD
             gameFrame.addView(touchOverlay, new FrameLayout.LayoutParams(-1, -1));
             touchOverlay.requestApplyInsets();
+        }
+        if (BuildConfig.DEBUG && performanceOverlay == null) {
+            performanceOverlay = new PerformanceOverlay(this);
+            performanceOverlay.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
+            performanceOverlay.setContentDescription(getString(R.string.dmAndroidDebugMenuTitle));
+            performanceOverlay.setOnLongClickListener(v -> { showDebugMenu(); return true; });
+            int margin = Math.round(8 * getResources().getDisplayMetrics().density);
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2, android.view.Gravity.TOP | android.view.Gravity.LEFT);
+            params.leftMargin = margin; params.topMargin = margin;
+            performanceOverlay.setOnApplyWindowInsetsListener((v, insets) -> {
+                android.graphics.Insets safe = insets.getInsets(WindowInsets.Type.displayCutout());
+                FrameLayout.LayoutParams p = (FrameLayout.LayoutParams)v.getLayoutParams();
+                p.leftMargin = safe.left + margin; p.topMargin = safe.top + margin; v.setLayoutParams(p);
+                return insets;
+            });
+            gameFrame.addView(performanceOverlay, params);
+            performanceOverlay.requestApplyInsets();
         }
         if (!view.getHolder().getSurface().isValid() || view.getWidth() <= 0 || view.getHeight() <= 0) return;
         File ext = getExternalFilesDir(null);
@@ -386,11 +587,18 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                 case -5 -> R.string.dmAndroidMissingConfig;
                 case -9 -> R.string.dmAndroidMissingOverlay;
                 case -10 -> R.string.dmAndroidInvalidOverlay;
+                case -11 -> 0;
+                case -12 -> 0;
                 default -> 0;
             };
-            showStartError(resource == 0 ? getString(R.string.dmAndroidStartFailed, result) : getString(resource)); return;
+            showStartError(result == -12
+                    ? "本机 GPU 不支持所需的 ASTC 4x4 纹理。请关闭 ASTC 补充包后使用普通贴图。"
+                    : result == -11
+                    ? "ASTC 补充包已启用，但校验信息缺失或无效。请关闭该选项使用普通贴图，或重新导入完整补充包。"
+                    : resource == 0 ? getString(R.string.dmAndroidStartFailed, result) : getString(resource)); return;
         }
         started = true;
+        if (cloudSave != null) cloudSave.onGameStarted();
         applyPadMode(PadInput.isPadMode());
         if (camSensor != null) camSensor.start(nativeCamSensor());
         // 越肩镜头的左右转按钮：盖在触屏层上面，只收按钮上的触摸。镜头可以在局中从「自定义」页打开（dm_cam.c dm_cam_mode），所以总是加上：
@@ -595,10 +803,10 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     @Override public void onDisplayRemoved(int id) { updateRefresh(); }
     @Override public void onDisplayChanged(int id) { updateRefresh(); }
     @Override protected void onResume() { super.onResume(); resumed = true; immersive(); startHost(); updateRefresh(); if (started) { nativeFocus(3); if (touchOverlay != null && bootFailure == 0) applyPadMode(PadInput.isPadMode()); if (camSensor != null) camSensor.start(nativeCamSensor()); if (camButtons != null) camButtons.start(); if (camThreats != null) camThreats.start(); } }
-    @Override protected void onPause() { resumed = false; if (camSensor != null) camSensor.stop(); if (camButtons != null) camButtons.stop(); if (camThreats != null) camThreats.stop(); if (inputDialog != null) inputDialog.dismiss(); releaseTouches(); PadInput.reset(); if (touchOverlay != null) touchOverlay.setInputEnabled(false); if (started) nativeFocus(0); super.onPause(); }
+    @Override protected void onPause() { resumed = false; GameDebugMenu.dismiss(this); if (camSensor != null) camSensor.stop(); if (camButtons != null) camButtons.stop(); if (camThreats != null) camThreats.stop(); if (inputDialog != null) inputDialog.dismiss(); releaseTouches(); PadInput.reset(); if (touchOverlay != null) touchOverlay.setInputEnabled(false); if (started) nativeFocus(0); super.onPause(); }
     @Override protected void onStart() { super.onStart(); if (started) nativeFocus(2); }
-    @Override protected void onStop() { if (started) nativeFocus(1); com.xiaoboluo.d2r.widget.HeroWidgetProvider.requestUpdate(this); super.onStop(); }
-    @Override protected void onDestroy() { if (displays != null) displays.unregisterDisplayListener(this); if (inputDialog != null) inputDialog.dismiss(); if (current.get() == this) current.clear(); super.onDestroy(); }
+    @Override protected void onStop() { if (started) nativeFocus(1); if (started && cloudSave != null) cloudSave.onGameStopped(); com.xiaoboluo.d2r.widget.HeroWidgetProvider.requestUpdate(this); super.onStop(); }
+    @Override protected void onDestroy() { if (cloudSave != null) cloudSave.shutdown(); GameDebugMenu.dismiss(this); if (displays != null) displays.unregisterDisplayListener(this); if (inputDialog != null) inputDialog.dismiss(); if (current.get() == this) current.clear(); super.onDestroy(); }
     @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) immersive(); else releaseTouches(); }
 
     @Override public void surfaceCreated(SurfaceHolder h) {}

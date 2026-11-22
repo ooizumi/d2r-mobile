@@ -1,0 +1,31 @@
+[Unit]
+Description=D2R Mobile cloud save service
+After=network.target
+
+[Service]
+Type=simple
+User=d2r-cloud-save
+Group=d2r-cloud-save
+WorkingDirectory=/opt/d2r-cloud-save
+ExecStart=/usr/bin/python3 /opt/d2r-cloud-save/dm/cloud_save/server.py --host 127.0.0.1 --port 8765 --data-dir /var/lib/d2r-cloud-save --auth-file /etc/d2r-cloud-save/auth.json --socket-timeout 15 --max-workers 8
+Restart=on-failure
+RestartSec=2
+UMask=0077
+MemoryMax=384M
+CPUQuota=50%
+StateDirectory=d2r-cloud-save
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

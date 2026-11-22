@@ -61,6 +61,11 @@ void dm_ui_safe_right(int units) { seen_safe_right = units; }
 int dm_touch_game_snapshot(dm_tg_snapshot *out) { memset(out,0,sizeof *out); return 0; }
 dm_ta_glyph dm_ta_skill(uint32_t id) { (void)id; return (dm_ta_glyph){.status=DM_TA_UNKNOWN,.atlas=-1}; }
 dm_ta_glyph dm_ta_current_set(const dm_tg_snapshot *s,uint64_t key,uint64_t now,int set) { (void)s; (void)key; (void)now; (void)set; return dm_ta_skill(0); }
+dm_ta_glyph dm_ta_visual_current_set(dm_ta_visual_cache *cache,const dm_tg_snapshot *s,uint64_t key,
+                                     uint64_t now,uint64_t sample,uint64_t scene,uint64_t world,int set) {
+    (void)cache; (void)s; (void)key; (void)now; (void)sample; (void)scene; (void)world; (void)set; return dm_ta_skill(0);
+}
+void dm_ta_visual_reset(dm_ta_visual_cache *cache) { (void)cache; }
 int dm_ta_frame_at(int atlas,int frame,dm_ta_frame *out) { (void)atlas; (void)frame; (void)out; return 0; }
 int dm_swapskill_slot(int slot,int *charges) { (void)slot; *charges=0; return 0; }
 int dm_ui_minimap_rect(float r[4]) { (void)r; return 0; }

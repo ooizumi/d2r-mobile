@@ -2,6 +2,7 @@
 // Latest-state lifecycle dispatch: the UI never waits for GPU; one host pthread serializes suspend/resume.
 #pragma once
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -9,6 +10,7 @@ typedef struct dm_lifecycle_ops {
     void (*focus)(int);
     void (*audio)(int);
     void (*graphics)(int);
+    void (*background_save)(int enabled);
 } dm_lifecycle_ops;
 
 typedef struct dm_lifecycle_dispatch {
@@ -17,16 +19,43 @@ typedef struct dm_lifecycle_dispatch {
     pthread_t thread;
     dm_lifecycle_ops ops;
     uint64_t requested, completed;
+    uint64_t save_requested, save_completed;
+    _Atomic int autosave_enabled, autosave_configured;
     int background, focus, stopping, started;
 } dm_lifecycle_dispatch;
+
+#define DM_LIFECYCLE_DISPATCH_INIT { \
+    .autosave_enabled = 1, \
+    .autosave_configured = 0 \
+}
 
 static void *dm_lifecycle_run(void *arg) {
     dm_lifecycle_dispatch *d = arg;
     int applied_background = 0;
     for (;;) {
         pthread_mutex_lock(&d->mutex);
-        while (!d->stopping && d->requested == d->completed) pthread_cond_wait(&d->changed, &d->mutex);
+        while (!d->stopping && d->requested == d->completed && d->save_requested == d->save_completed)
+            pthread_cond_wait(&d->changed, &d->mutex);
         if (d->stopping) { pthread_mutex_unlock(&d->mutex); return NULL; }
+        uint64_t save_request = d->save_requested;
+        int save = save_request != d->save_completed;
+        pthread_mutex_unlock(&d->mutex);
+
+        // A background event may have been coalesced with an immediate foreground event, but its
+        // one-shot save request remains queued. Never discard a valid commit just because onStart
+        // won the race to the dispatcher.
+        if (save) {
+            int enabled = atomic_load(&d->autosave_enabled) != 0;
+            if (d->ops.background_save) d->ops.background_save(enabled);
+            pthread_mutex_lock(&d->mutex);
+            d->save_completed = save_request;
+            pthread_cond_broadcast(&d->changed);
+            pthread_mutex_unlock(&d->mutex);
+        }
+
+        // dm_save_wait can block for its full timeout. Re-read lifecycle state afterwards so a quick
+        // return to the foreground never causes a stale GPU suspend.
+        pthread_mutex_lock(&d->mutex);
         uint64_t request = d->requested;
         int background = d->background, focus = d->focus;
         pthread_mutex_unlock(&d->mutex);
@@ -52,8 +81,12 @@ static void *dm_lifecycle_run(void *arg) {
 }
 
 static int dm_lifecycle_start(dm_lifecycle_dispatch *d, dm_lifecycle_ops ops) {
+    int configured = atomic_load(&d->autosave_configured) != 0;
+    int autosave = configured ? atomic_load(&d->autosave_enabled) != 0 : 1;
     memset(d, 0, sizeof *d);
     d->ops = ops; d->focus = 1;
+    atomic_init(&d->autosave_enabled, autosave);
+    atomic_init(&d->autosave_configured, configured);
     int rc = pthread_mutex_init(&d->mutex, NULL);
     if (rc) return rc;
     rc = pthread_cond_init(&d->changed, NULL);
@@ -64,10 +97,17 @@ static int dm_lifecycle_start(dm_lifecycle_dispatch *d, dm_lifecycle_ops ops) {
     return 0;
 }
 
+// UI may call this after loading the native library and before nativeStart. The value survives
+// dm_lifecycle_start; an unconfigured dispatcher defaults to enabled.
+static void dm_lifecycle_set_background_autosave(dm_lifecycle_dispatch *d, int enabled) {
+    atomic_store(&d->autosave_enabled, enabled != 0);
+    atomic_store(&d->autosave_configured, 1);
+}
+
 static void dm_lifecycle_post(dm_lifecycle_dispatch *d, int event) {
     if (event < 0 || event > 3) return;
     pthread_mutex_lock(&d->mutex);
-    if (event == 1) d->background = 1;
+    if (event == 1) { d->background = 1; ++d->save_requested; }
     else if (event == 2 || event == 3) d->background = 0;
     d->focus = event == 1 ? 3 : event == 3 ? 1 : 2;
     ++d->requested;
