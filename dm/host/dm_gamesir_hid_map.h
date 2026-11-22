@@ -2,7 +2,7 @@
 // The descriptor seen on the target device is:
 //   Generic Desktop: X/Y/Z/Rz usages 48/49/50/53, logical 0..255
 //   Button page: usages 1..16, logical 0..1
-//   Generic Desktop hat switch usage 57, logical 0..7 (8 means neutral)
+//   Generic Desktop hat switch usage 57, logical 0..7 (observed null: 15)
 //   Simulation Controls: Gas usage 196 and Brake usage 197, logical 0..255
 // Y axes are inverted because HID reports increase downward while nn::hid's
 // sticks increase upward. Unknown pages/usages and invalid ranges are ignored.
@@ -128,10 +128,11 @@ static inline int dm_gamesir_hid_update(dm_gamesir_hid_state *state,
 
     if (page == 0x01) {
         if (usage == 57) {
-            // Some descriptors advertise 0..7 while still reporting 8 as the
-            // neutral/null state. Recognise 8 independently of the range.
-            if ((value != 8 && (value < min || value > max))
-                || !dm_gamesir_hid_hat_mask(value, &hat))
+            // A HID null position is outside the logical range, not necessarily
+            // max+1: this GameSir sends 15. Publish release instead of retaining
+            // the last direction, which otherwise overrides inventory sticks.
+            if (value >= min && value <= max
+                && !dm_gamesir_hid_hat_mask(value, &hat))
                 return 0;
             old_buttons = state->buttons;
             state->buttons = (old_buttons & ~dpad) | hat;

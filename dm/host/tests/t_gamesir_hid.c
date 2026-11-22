@@ -117,7 +117,7 @@ static void test_hat_diagonals_and_neutral(void) {
     CHECK(dm_gamesir_hid_update(&s, 0x01, 57, 8, 0, 7) == 0,
           "already-neutral hat should report no change");
     CHECK(dm_gamesir_hid_update(&s, 0x01, 57, 9, 0, 7) == 0,
-          "unknown hat value must be ignored");
+          "another null on an already-neutral hat should report no change");
 }
 
 static void test_axes_y_inversion_centre_endpoints_and_clamp(void) {
@@ -149,6 +149,38 @@ static void test_axes_y_inversion_centre_endpoints_and_clamp(void) {
     for (i = 0; i < 4; ++i)
         CHECK(s.axes[i] == before.axes[i],
               "invalid-axis range changed axis %u", i);
+}
+
+static void test_hat_null_release_then_stick(void) {
+    /* The real X4A reports 15 on release, outside its advertised 0..7 range.
+     * HID null reports must release every direction, preserving other input. */
+    static const int64_t nulls[] = { 15, 8, -1, 9 };
+    const uint64_t dpad = DM_BTN_LEFT | DM_BTN_UP | DM_BTN_RIGHT | DM_BTN_DOWN;
+    dm_gamesir_hid_state s;
+    unsigned n;
+    int direction;
+
+    for (n = 0; n < sizeof nulls / sizeof nulls[0]; ++n) {
+        for (direction = 0; direction < 8; ++direction) {
+            dm_gamesir_hid_clear(&s);
+            dm_gamesir_hid_update(&s, 9, 1, 1, 0, 1);
+            dm_gamesir_hid_update(&s, 2, 196, 255, 0, 255);
+            dm_gamesir_hid_update(&s, 1, 48, 255, 0, 255);
+            CHECK(dm_gamesir_hid_update(&s, 1, 57, direction, 0, 7) == 1,
+                  "direction %d press not reported", direction);
+            CHECK((s.buttons & dpad) != 0, "direction %d missing", direction);
+            CHECK(dm_gamesir_hid_update(&s, 1, 57, nulls[n], 0, 7) == 1,
+                  "direction %d null %lld release swallowed", direction, (long long)nulls[n]);
+            CHECK(s.buttons == (DM_BTN_A | DM_BTN_ZR) && s.axes[0] == DM_STICK_MAX,
+                  "null %lld must clear only dpad", (long long)nulls[n]);
+            CHECK(dm_gamesir_hid_update(&s, 1, 57, nulls[n], 0, 7) == 0,
+                  "duplicate null should not publish a change");
+            CHECK(dm_gamesir_hid_update(&s, 1, 48, 0, 0, 255) == 1,
+                  "stick after null release did not update");
+            CHECK((s.buttons & dpad) == 0 && s.axes[0] == -DM_STICK_MAX,
+                  "stick update retained a stuck dpad direction");
+        }
+    }
 }
 
 static void test_triggers_half_threshold_and_independent_release(void) {
@@ -228,6 +260,7 @@ static void test_clear_and_unknown_reports(void) {
 int main(void) {
     test_measured_report_mapping();
     test_hat_diagonals_and_neutral();
+    test_hat_null_release_then_stick();
     test_axes_y_inversion_centre_endpoints_and_clamp();
     test_triggers_half_threshold_and_independent_release();
     test_clear_and_unknown_reports();

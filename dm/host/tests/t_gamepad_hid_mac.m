@@ -43,6 +43,17 @@ int main(void) {
         event(p,9,1,0); assert(last_buttons==0);
         event(p,1,48,255); assert(last_axes[0]==DM_STICK_MAX);
         event(p,1,49,0); assert(last_axes[1]==DM_STICK_MAX);
+        event(p,9,1,1);
+        for (int direction=0;direction<8;++direction) {
+            event(p,1,57,direction);
+            assert(last_buttons & (DM_BTN_LEFT|DM_BTN_UP|DM_BTN_RIGHT|DM_BTN_DOWN));
+            event(p,1,57,15); /* Measured X4A release report. */
+            assert(last_buttons==DM_BTN_A && last_axes[1]==DM_STICK_MAX);
+            event(p,1,48,direction % 2 ? 0 : 255);
+            assert(last_buttons==DM_BTN_A);
+            assert(last_axes[0]==(direction % 2 ? -DM_STICK_MAX : DM_STICK_MAX));
+        }
+        event(p,9,1,0); assert(last_buttons==0);
         dm_gamepad_reset();
         assert(last_buttons==0 && last_axes[0]==0 && last_axes[1]==0);
         event(p,9,1,1); assert(last_buttons==0 && p->state.buttons==0);
@@ -57,7 +68,7 @@ int main(void) {
         dm_gamepad_inject_n(2,0,0,0,0,0);
         dm_gamepad_reset();
         assert(last_buttons==0 && last_axes[0]==0 && last_axes[1]==0 && last_axes[2]==0 && last_axes[3]==0);
-        puts("t_gamepad_hid_mac: production input, focus, disconnect and merge passed");
+        puts("t_gamepad_hid_mac: production input, hat null release, subsequent stick, focus, disconnect and merge passed");
     }
     return 0;
 }
